@@ -4,6 +4,9 @@
 # Debian-slim (glibc): yt-dlp binary + bcrypt prebuilds don't work on alpine.
 FROM node:18-slim AS builder
 WORKDIR /app
+# youtube-dl-exec's install script requires Python 3.9+ (the yt-dlp
+# binary itself is standalone, but the gate fails the build without it).
+RUN apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*
 COPY package*.json ./
 RUN npm ci
 COPY prisma ./prisma
