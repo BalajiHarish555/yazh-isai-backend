@@ -3,4 +3,5 @@ dist/
 .env
 *.log
 *.err
+*.db
 .DS_Store

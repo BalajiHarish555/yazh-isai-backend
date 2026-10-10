@@ -3,7 +3,10 @@ generator prisma {
 }
 
 datasource db {
-  provider = "sqlite"
+  // PostgreSQL everywhere: Render/Neon in cloud, and local dev points at
+  // the same cloud DB (see .env). SQLite can't survive cloud deploys
+  // (ephemeral disk), so a single provider keeps migrate deploy honest.
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
