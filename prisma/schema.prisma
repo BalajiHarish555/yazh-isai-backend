@@ -1,0 +1,203 @@
+generator prisma {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String           @id @default(uuid())
+  email           String           @unique
+  username        String           @unique
+  passwordHash    String
+  role            String           @default("USER")
+  isActive        Boolean          @default(true)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  profile         Profile?
+  preferences     UserPreferences?
+  likedTracks     LikedTrack[]
+  likedAlbums     LikedAlbum[]
+  followedArtists FollowedArtist[]
+  playlists       Playlist[]
+  history         ListeningEvent[]
+}
+
+model Profile {
+  id                String   @id @default(uuid())
+  userId            String   @unique
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  displayName       String
+  avatarUrl         String?
+  bio               String?
+  country           String?
+  preferredLanguage String?
+  // Cross-device library: liked songs + playlists as a stringified JSON
+  // snapshot of plain Song objects. (String, not Json: this SQLite
+  // connector rejects the Json type.) Relational tables
+  // (LikedTrack/PlaylistTrack) FK to the catalog Track table, so external
+  // songs (YouTube ids, local files) cannot live there — the snapshot
+  // carries full Song objects and works for any source.
+  library           String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model UserPreferences {
+  id                        String   @id @default(uuid())
+  userId                    String   @unique
+  user                      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  preferredGenres           String
+  preferredArtists          String
+  preferredMoods            String
+  preferredEnergy           Float?
+  preferredLanguages        String
+  explicitContentPreference Boolean  @default(false)
+  autoplay                  Boolean  @default(true)
+  audioQuality              String   @default("high")
+}
+
+model Artist {
+  id        String           @id @default(uuid())
+  name      String
+  bio       String?
+  imageUrl  String?
+  genres    String
+  albums    Album[]
+  tracks    TrackArtist[]
+  followers FollowedArtist[]
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@index([name])
+}
+
+model Album {
+  id          String       @id @default(uuid())
+  title       String
+  artistId    String
+  artist      Artist       @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  artworkUrl  String?
+  releaseDate DateTime?
+  albumType   String       @default("ALBUM")
+  tracks      Track[]
+  likedBy     LikedAlbum[]
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([title])
+}
+
+model Track {
+  id               String           @id @default(uuid())
+  title            String
+  albumId          String?
+  album            Album?           @relation(fields: [albumId], references: [id], onDelete: SetNull)
+  duration         Int
+  trackNumber      Int?
+  artworkUrl       String?
+  playbackSource   String           @default("local")
+  playbackSourceId String?
+  genre            String?
+  language         String?
+  releaseDate      DateTime?
+  energy           Float            @default(0.5)
+  valence          Float            @default(0.5)
+  danceability     Float            @default(0.5)
+  acousticness     Float            @default(0.5)
+  instrumentalness Float            @default(0.5)
+  speechiness      Float            @default(0.5)
+  tempo            Float            @default(120.0)
+  era              String?
+  mood             String
+  artists          TrackArtist[]
+  playlists        PlaylistTrack[]
+  likedBy          LikedTrack[]
+  history          ListeningEvent[]
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  @@index([title])
+}
+
+model TrackArtist {
+  trackId  String
+  artistId String
+  track    Track  @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  artist   Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+
+  @@id([trackId, artistId])
+}
+
+model Playlist {
+  id          String          @id @default(uuid())
+  ownerId     String
+  owner       User            @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  coverImage  String?
+  isPublic    Boolean         @default(true)
+  tracks      PlaylistTrack[]
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+model PlaylistTrack {
+  id         String   @id @default(uuid())
+  playlistId String
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  trackId    String
+  track      Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  position   Int
+  createdAt  DateTime @default(now())
+
+  @@unique([playlistId, trackId])
+}
+
+model LikedTrack {
+  userId    String
+  trackId   String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, trackId])
+}
+
+model LikedAlbum {
+  userId    String
+  albumId   String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  album     Album    @relation(fields: [albumId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, albumId])
+}
+
+model FollowedArtist {
+  userId    String
+  artistId  String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  artist    Artist   @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@id([userId, artistId])
+}
+
+model ListeningEvent {
+  id        String   @id @default(uuid())
+  userId    String
+  trackId   String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  position  Int
+  duration  Int
+  completed Boolean
+  eventType String
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([trackId])
+}

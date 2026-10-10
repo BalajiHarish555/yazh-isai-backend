@@ -1,0 +1,369 @@
+import { Injectable, Logger } from '@nestjs/common';
+import youtubedl from 'youtube-dl-exec';
+import ytdl from '@distube/ytdl-core';
+import fetch from 'node-fetch';
+import { CacheService } from '../common/cache.service';
+import { JioSaavnService } from './jiosaavn.service';
+
+@Injectable()
+export class YouTubeMusicService {
+  private readonly INNERTUBE_API_BASE = 'https://music.youtube.com/youtubei/v1';
+  private readonly logger = new Logger(YouTubeMusicService.name);
+
+  constructor(
+    private cacheService: CacheService,
+    private jioSaavnService: JioSaavnService,
+  ) {}
+
+  async getAudioStreamDetails(videoId: string): Promise<{
+    streamUrl: string;
+    bitrate: number;
+    codec: string;
+    mimeType: string;
+    qualityLabel: string;
+    quality: 'high' | 'medium' | 'low';
+    isLossless: boolean;
+    source: string;
+  } | null> {
+    const startTime = Date.now();
+    // NOTE: googlevideo URLs expire (typically within hours), so cache for
+    // 30 min max — a stale cached URL plays nothing.
+    const cacheKey = `audio_details_${videoId}`;
+    const cachedDetails = await this.cacheService.get<any>(cacheKey);
+    if (cachedDetails) {
+      this.logger.log(`Cache hit for audio details: ${videoId} (${Date.now() - startTime}ms)`);
+      return cachedDetails;
+    }
+
+    this.logger.log(`Cache miss for audio details: ${videoId}, resolving...`);
+
+    try {
+      // Primary path: youtube-dl-exec (yt-dlp) resolves the real bestaudio
+      // URL reliably. ytdl-core runs ONLY as a lazy fallback below — it is
+      // frequently blocked, and an eagerly-created promise for it can reject
+      // while unobserved and crash the process.
+      const resolveViaYtDlp = async () => {
+        const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+          getUrl: true,
+          format: 'bestaudio/bestaudio*',
+          noCheckCertificates: true,
+          noWarnings: true,
+          noPlaylist: true,
+          socketTimeout: 10,
+          retries: 2,
+        });
+        const resultUrl = typeof url === 'string' ? url.trim() : null;
+        if (resultUrl) {
+          // youtube-dl -g returns only the URL, so codec is inferred from the
+          // URL signature; bitrates are conservative estimates, not claims.
+          const isWebm = resultUrl.includes('mime=audio%2Fwebm') || resultUrl.includes('audio/webm');
+          return {
+            streamUrl: resultUrl,
+            bitrate: isWebm ? 160 : 128,
+            codec: isWebm ? 'Opus' : 'AAC',
+            mimeType: isWebm ? 'audio/webm; codecs="opus"' : 'audio/mp4; codecs="mp4a.40.2"',
+            qualityLabel: isWebm ? '~160kbps Opus (High)' : '~128kbps AAC (Medium)',
+            quality: (isWebm ? 'high' : 'medium') as 'high' | 'medium' | 'low',
+            isLossless: false,
+            source: 'YouTube Music',
+          };
+        }
+        return null;
+      };
+
+      // ytdl-core fallback: richer format metadata when yt-dlp fails.
+      // Created lazily inside the fallback branch so a rejection can never
+      // go unobserved (which previously crashed the server outright).
+      const resolveViaYtdlCore = async () => {
+        const info = await ytdl.getInfo(videoId, {
+          requestOptions: {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            }
+          }
+        });
+        const audioOnlyFormats = info.formats
+          .filter(format => format.hasAudio && !format.hasVideo && format.url && (format.audioBitrate || 0) > 0)
+          .sort((a, b) => {
+            const diff = (b.audioBitrate || 0) - (a.audioBitrate || 0);
+            if (diff !== 0) return diff;
+            // Tie-break toward Opus/webm: better quality per bit than AAC.
+            const aOpus = (a.mimeType || '').includes('opus') ? 1 : 0;
+            const bOpus = (b.mimeType || '').includes('opus') ? 1 : 0;
+            return bOpus - aOpus;
+          });
+
+        if (audioOnlyFormats.length > 0 && audioOnlyFormats[0].url) {
+          return this.describeAudioFormat(audioOnlyFormats[0]);
+        }
+        return null;
+      };
+
+      const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> =>
+        Promise.race([
+          promise,
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms)),
+        ]);
+
+      let details: any = null;
+      try {
+        details = await withTimeout(resolveViaYtDlp(), 20000);
+      } catch (error: any) {
+        this.logger.warn(`youtube-dl-exec failed for ${videoId} (${error?.message || error}), trying ytdl-core fallback`);
+      }
+
+      if (!details) {
+        try {
+          details = await withTimeout(resolveViaYtdlCore(), 6000);
+        } catch (error: any) {
+          this.logger.warn(`ytdl-core fallback failed for ${videoId} (${error?.message || error})`);
+        }
+      }
+
+      if (details) {
+        await this.cacheService.set(cacheKey, details, 1800);
+        this.logger.log(`Resolved ${details.qualityLabel} for ${videoId} in ${Date.now() - startTime}ms`);
+        return details;
+      }
+
+      return null;
+    } catch (error) {
+      this.logger.error(`Error resolving audio stream for videoId ${videoId}:`, error);
+      return null;
+    }
+  }
+
+  private describeAudioFormat(best: any) {
+    const bitrate = best.audioBitrate || 128;
+    const mimeType: string = best.mimeType || 'audio/webm; codecs="opus"';
+    const isOpus = mimeType.includes('opus');
+    const rawCodec: string = best.audioCodec || '';
+    const codec = isOpus ? 'Opus' : (rawCodec.includes('mp4a') ? 'AAC' : (rawCodec || 'AAC'));
+    const quality: 'high' | 'medium' | 'low' = bitrate >= 150 ? 'high' : bitrate >= 100 ? 'medium' : 'low';
+    return {
+      streamUrl: best.url as string,
+      bitrate,
+      codec,
+      mimeType,
+      qualityLabel: `${bitrate}kbps ${codec} (${quality === 'high' ? 'High' : quality === 'medium' ? 'Medium' : 'Low'})`,
+      quality,
+      // YouTube Music streams are lossy. Never label these lossless/FLAC.
+      isLossless: false,
+      source: 'YouTube Music',
+    };
+  }
+
+  async getAudioStreamUrl(videoId: string): Promise<string | null> {
+    const details = await this.getAudioStreamDetails(videoId);
+    return details?.streamUrl || null;
+  }
+
+  async searchTracks(query: string) {
+    const startTime = Date.now();
+    const cacheKey = `search_${query}`;
+    const cachedResults = await this.cacheService.get<any[]>(cacheKey);
+    if (cachedResults) {
+      this.logger.log(`Cache hit for search: ${query} (took ${Date.now() - startTime}ms)`);
+      return cachedResults;
+    }
+
+    this.logger.log(`Searching for: ${query}`);
+
+    try {
+      const response = await fetch(`${this.INNERTUBE_API_BASE}/search`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'X-Origin': 'https://music.youtube.com'
+        },
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: 'WEB_REMIX',
+              clientVersion: '1.20240101.01.00',
+              hl: 'en',
+              gl: 'US'
+            }
+          },
+          query,
+          params: 'EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D'
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`YouTube Music API error: ${response.statusText}`);
+      }
+
+      const data: any = await response.json();
+      const results = this.parseSearchSongs(data);
+
+      await this.cacheService.set(cacheKey, results, 600);
+
+      // 🚀 BACKGROUND PRE-FETCHING: warm the exact resolvers play uses —
+      // Saavn 320 (needs title+artists, which results carry) AND YouTube —
+      // so tapping play is usually a cache hit on both paths.
+      if (results.length > 0) {
+        const top = results.slice(0, 4);
+        this.logger.log(`🚀 Pre-fetching audio streams for top ${top.length} search results in background...`);
+        for (const track of top) {
+          // Fire-and-forget per track; failures only mean a cold resolve later.
+          this.jioSaavnService
+            .getBestStream(track.title, track.artists)
+            .catch((err) => this.logger.warn('Background Saavn pre-fetch warning:', err?.message || err));
+          this.getAudioStreamDetails(track.id)
+            .catch((err) => this.logger.warn('Background YouTube pre-fetch warning:', err?.message || err));
+        }
+      }
+
+      this.logger.log(`Search completed for "${query}" in ${Date.now() - startTime}ms`);
+      return results;
+    } catch (error) {
+      this.logger.error('YouTube Music Search Error:', error);
+      return [
+        {
+          id: 'suxP321fM5s',
+          title: `Search results for "${query}"`,
+          artists: 'YouTube Music',
+          thumbnail: `https://images.unsplash.com/photo-1493225457124-a3eb161ffa5f?w=1200&q=90`,
+          source: 'YouTube Music'
+        }
+      ];
+    }
+  }
+
+  private parseSearchSongs(data: any) {
+    const results: any[] = [];
+    try {
+      let contents = [];
+      
+      if (data?.contents?.tabbedSearchResultsRenderer?.tabs) {
+        const tabs = data.contents.tabbedSearchResultsRenderer.tabs;
+        for (const tab of tabs) {
+          const tabRenderer = tab.tabRenderer;
+          if (!tabRenderer) continue;
+          
+          const content = tabRenderer.content;
+          if (!content) continue;
+          
+          if (content.sectionListRenderer) {
+            const sections = content.sectionListRenderer.contents;
+            for (const section of sections) {
+              if (section.musicShelfRenderer) {
+                contents = section.musicShelfRenderer.contents;
+                break;
+              }
+            }
+          }
+          if (contents.length > 0) break;
+        }
+      }
+      
+      if (contents.length === 0 && data?.contents?.sectionListRenderer) {
+        const sections = data.contents.sectionListRenderer.contents;
+        for (const section of sections) {
+          if (section.musicShelfRenderer) {
+            contents = section.musicShelfRenderer.contents;
+            break;
+          }
+        }
+      }
+      
+      if (contents.length === 0 && data?.contents?.sectionListRenderer?.contents) {
+        const sections = data.contents.sectionListRenderer.contents;
+        for (const section of sections) {
+          if (section.musicQueueRenderer) {
+            contents = section.musicQueueRenderer.content;
+            break;
+          }
+        }
+      }
+
+      for (const item of contents) {
+        const renderer = item.musicResponsiveListItemRenderer;
+        if (!renderer) continue;
+
+        let videoId = null;
+        if (renderer.playlistItemData?.videoId) {
+          videoId = renderer.playlistItemData.videoId;
+        } else if (renderer.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.navigationEndpoint?.watchEndpoint?.videoId) {
+          videoId = renderer.flexColumns[0].musicResponsiveListItemFlexColumnRenderer.text.runs[0].navigationEndpoint.watchEndpoint.videoId;
+        }
+
+        let title = null;
+        if (renderer.flexColumns?.[0]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs?.[0]?.text) {
+          title = renderer.flexColumns[0].musicResponsiveListItemFlexColumnRenderer.text.runs[0].text;
+        } else if (renderer.title?.runs?.[0]?.text) {
+          title = renderer.title.runs[0].text;
+        }
+
+        let artists = '';
+        if (renderer.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs) {
+          const artistRuns = renderer.flexColumns[1].musicResponsiveListItemFlexColumnRenderer.text.runs;
+          const rawText = artistRuns.map((r: any) => r.text).filter(Boolean).join('');
+          artists = rawText
+            .replace(/,\s*&\s*,?/g, ' & ')
+            .replace(/,\s*•\s*,?/g, ' • ')
+            .replace(/\s*,\s*,+/g, ', ')
+            .replace(/,\s*&/g, ' &')
+            .trim();
+        } else if (renderer.subtitle?.runs?.[0]?.text) {
+          artists = renderer.subtitle.runs[0].text;
+        }
+
+        let thumbnail = '';
+        let thumbnails = [];
+
+        if (renderer.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails) {
+          thumbnails = renderer.thumbnail.musicThumbnailRenderer.thumbnail.thumbnails;
+        } else if (renderer.thumbnail?.thumbnails) {
+          thumbnails = renderer.thumbnail.thumbnails;
+        } else if (renderer.thumbnails) {
+          thumbnails = renderer.thumbnails;
+        }
+
+        if (thumbnails.length > 0) {
+          const sortedThumbnails = [...thumbnails].sort((a, b) => {
+            const areaA = (a.width || 0) * (a.height || 0);
+            const areaB = (b.width || 0) * (b.height || 0);
+            return areaB - areaA;
+          });
+
+          let bestThumbnailUrl = sortedThumbnails[0]?.url || '';
+          if (bestThumbnailUrl && bestThumbnailUrl.includes('yt3.googleusercontent.com')) {
+            // Request a modest size: w1920 files (~350KB each) made every
+            // cover in lists/grids load slowly. w500 (~30-60KB) is still
+            // retina-crisp for the largest in-app artwork (320px player art).
+            bestThumbnailUrl = bestThumbnailUrl.replace(/=w\d+-h\d+-l\d+-rj/, '=w500-h500-l90-rj');
+          }
+          thumbnail = bestThumbnailUrl;
+        }
+
+        if (!thumbnail && videoId) {
+          // NOTE: maxresdefault.jpg 404s for videos without HD thumbnails
+          // (very common) and the player then shows its fallback tile.
+          // hqdefault.jpg is guaranteed to exist for every video.
+          thumbnail = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+        }
+
+        if (!thumbnail) {
+          thumbnail = 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=800&q=80';
+        }
+
+        if (videoId && title) {
+          results.push({
+            id: videoId,
+            title,
+            artists,
+            thumbnail,
+            source: 'YouTube Music',
+            audioQuality: 'Best available • up to 320kbps'
+          });
+        }
+      }
+    } catch (e) {
+      console.error('Error parsing YT Music search response:', e);
+    }
+    return results;
+  }
+}
