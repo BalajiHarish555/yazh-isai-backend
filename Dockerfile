@@ -3,8 +3,9 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy dependency files
-COPY package*.json ./
+# Copy dependency files (+ .npmrc so fresh installs use the known-good
+# peer resolution instead of failing on ERESOLVE)
+COPY package*.json .npmrc ./
 COPY prisma ./prisma/
 
 # Install all dependencies including devDependencies for build
@@ -25,12 +26,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 
 # Copy package files and prisma
-COPY package*.json ./
+COPY package*.json .npmrc ./
 COPY prisma ./prisma/
 
 # Install only production dependencies, plus the Prisma CLI (devDependency
 # upstream) so `migrate deploy` runs at container start.
-RUN npm install --only=production
+RUN npm install --omit=dev
 RUN npm install --no-save prisma@5.22.0
 
 # Copy built dist files & generated prisma client from builder
