@@ -15,7 +15,10 @@ function validateEnv() {
     if (!process.env.DATABASE_URL) {
       throw new Error('DATABASE_URL is required in production');
     }
-    if (!process.env.CORS_ORIGIN) {
+    // Same-origin cloud deploys are covered by RENDER_EXTERNAL_URL
+    // (allowlisted automatically below) — only demand an explicit list
+    // when there is no platform-provided origin either.
+    if (!process.env.CORS_ORIGIN && !process.env.RENDER_EXTERNAL_URL) {
       throw new Error('CORS_ORIGIN must be set in production');
     }
   }
