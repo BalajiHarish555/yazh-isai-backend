@@ -217,6 +217,23 @@ export class TracksController {
     return out.slice(0, n);
   }
 
+  // Chart feed for the Discover page. Declared before ':id' so 'trending'
+  // isn't swallowed as an id.
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
+  @Get('trending')
+  async getTrending(
+    @Query('limit') limit?: string,
+    @Query('lang') lang?: string,
+    @Query('stable') stable?: string,
+  ) {
+    const parsed = Array.isArray(limit) ? NaN : parseInt(limit || '30', 10);
+    const n = Number.isFinite(parsed) ? Math.max(1, Math.min(50, Math.floor(parsed))) : 30;
+    return this.jioSaavnService.getTrendingSongs(n, {
+      lang: typeof lang === 'string' ? lang.slice(0, 20) : undefined,
+      stable: stable === '1' || stable === 'true',
+    });
+  }
+
   @Get()
   async findAll(
     @Query('mood') mood: string,

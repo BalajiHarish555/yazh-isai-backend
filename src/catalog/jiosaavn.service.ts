@@ -465,39 +465,95 @@ export class JioSaavnService {
     };
   }
 
+  /** Language keywords for matching chart playlists to the listener. */
+  private static readonly CHART_LANG_KEYS: Record<string, string[]> = {
+    tamil: ['tamil', 'kollywood'],
+    hindi: ['hindi', 'bollywood'],
+    telugu: ['telugu', 'tollywood'],
+    malayalam: ['malayalam', 'mollywood'],
+    kannada: ['kannada', 'sandalwood'],
+    english: ['english', 'hollywood', 'pop', 'top 40'],
+  };
+
   /**
-   * Real trending data: Saavn's trending playlists ("Now Trending",
-   * "Trending Today"), shuffled on every call so each visit looks fresh.
+   * Real trending data from Saavn's trending/chart playlists. Set `stable`
+   * for chart-style ranked output (same order until the 15-min cache turns
+   * over); default shuffles so casual visits look fresh. `lang` prefers
+   * playlists matching the listener's language (tamil/hindi/...) so Tamil
+   * users get Kollywood charts, not Bollywood ones.
    * Cached briefly (15 min) — trends move, but not second-to-second.
    */
-  async getTrendingSongs(limit = 12): Promise<any[]> {
-    const cacheKey = 'saavn_trending_songs';
+  async getTrendingSongs(limit = 12, opts: { stable?: boolean; lang?: string } = {}): Promise<any[]> {
+    const langKeys = JioSaavnService.CHART_LANG_KEYS[(opts.lang || '').toLowerCase()] || [];
+    const cacheKey = `saavn_charts_v2_${langKeys[0] || 'mix'}`;
     const cached = await this.cacheService.get<any[]>(cacheKey);
-    // Serve cache but reshuffle: content stays fresh for 15 min, order is
-    // always new.
     const pool: any[] = cached || [];
-    if (pool.length === 0) {
-      const data = await this.fetchJson(
-        `${SAAVN_API}?__call=content.getTrending&_format=json&_marker=0&api_version=4&ctx=web6dot0`,
-      );
-      const items: any[] = Array.isArray(data) ? data : [];
-      const lists = items.filter((x) => x?.type === 'playlist');
-      // Prefer explicitly-trending playlists, take up to two for variety.
-      lists.sort((a, b) => {
-        const score = (x: any) => (/trend/i.test(x?.title || '') ? 0 : 1);
-        return score(a) - score(b);
-      });
-      const collected: any[] = [];
+    const collectFrom = async (lists: any[], collected: any[]) => {
       for (const pl of lists.slice(0, 2)) {
+        if (!pl?.id) continue;
         const details = await this.fetchJson(
           `${SAAVN_API}?__call=playlist.getDetails&listid=${pl.id}&p=1&n=30&_format=json&_marker=0&api_version=4&ctx=web6dot0`,
         );
         const songs: any[] = details?.list || [];
         for (const s of songs) {
           const mapped = this.mapTrendingSong(s);
-          if (mapped && !collected.some((c) => c.title === mapped.title)) collected.push(mapped);
+          const key = mapped ? this.normalizeTitle(mapped.title) : '';
+          if (mapped && key && !collected.some((c) => this.normalizeTitle(c.title) === key)) {
+            collected.push(mapped);
+          }
         }
         if (collected.length >= limit * 2) break;
+      }
+    };
+    if (pool.length === 0) {
+      const collected: any[] = [];
+      // Saavn's own charts shelf is Hindi-only and its search surface is
+      // song-dominated, so for other languages build the chart straight
+      // from song search ranked by play count — a genuine popularity chart.
+      if (langKeys.length > 0) {
+        try {
+          const sq = await this.fetchJson(
+            `${SAAVN_API}?__call=search.getResults&q=${encodeURIComponent(`${langKeys[0]} top songs`)}&p=1&n=30&_format=json&_marker=0&api_version=4&ctx=web6dot0`,
+          );
+          const found: any[] = sq?.results || [];
+          const langSongs = found
+            .filter(
+              (x) =>
+                x?.type === 'song' &&
+                String(x?.language || '').toLowerCase() === langKeys[0],
+            )
+            .sort((a, b) => Number(b?.play_count || 0) - Number(a?.play_count || 0));
+          for (const s of langSongs) {
+            const mapped = this.mapTrendingSong(s);
+            // "(From ...)" variants of the same song share a normalized
+            // title — keep only the highest-play-count one.
+            const key = mapped ? this.normalizeTitle(mapped.title) : '';
+            if (mapped && key && !collected.some((c) => this.normalizeTitle(c.title) === key)) {
+              collected.push(mapped);
+            }
+            if (collected.length >= limit * 2) break;
+          }
+        } catch {
+          // Fall through to the generic trending shelf.
+        }
+      }
+      if (collected.length === 0) {
+        const data = await this.fetchJson(
+          `${SAAVN_API}?__call=content.getTrending&_format=json&_marker=0&api_version=4&ctx=web6dot0`,
+        );
+        const items: any[] = Array.isArray(data) ? data : [];
+        const lists = items.filter((x) => x?.type === 'playlist');
+        // Prefer the listener's language first ("Tamil Hits" over "Now
+        // Trending"), then explicitly-trending playlists. Take up to two.
+        const langHit = (x: any) =>
+          langKeys.some((k) => (x?.title || '').toLowerCase().includes(k)) ? 0 : 1;
+        lists.sort((a, b) => {
+          const dl = langHit(a) - langHit(b);
+          if (dl !== 0) return dl;
+          const score = (x: any) => (/trend|chart|top/i.test(x?.title || '') ? 0 : 1);
+          return score(a) - score(b);
+        });
+        await collectFrom(lists, collected);
       }
       if (collected.length === 0) {
         this.logger.warn('Saavn trending returned no songs');
@@ -505,6 +561,10 @@ export class JioSaavnService {
       }
       await this.cacheService.set(cacheKey, collected, 900);
       pool.push(...collected);
+    }
+    if (opts.stable) {
+      // Chart mode: rank order is meaningful, keep it.
+      return pool.slice(0, limit).map((t, i) => ({ ...t, rank: i + 1 }));
     }
     // Fisher-Yates shuffle a copy — fresh order on every call.
     const shuffled = [...pool];
