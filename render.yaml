@@ -20,6 +20,7 @@ services:
         generateValue: true
       # Custom-domain frontend origin, if the SPA is served elsewhere.
       # Same-origin deploys need nothing: RENDER_EXTERNAL_URL is allowlisted
-      # automatically (see src/main.ts).
+      # automatically (see src/main.ts). The native Android/iOS apps run
+      # from a local origin, so it is allowlisted explicitly here.
       - key: CORS_ORIGIN
-        value: ""
+        value: "https://localhost,http://localhost,capacitor://localhost"
