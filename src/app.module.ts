@@ -35,6 +35,18 @@ import { ProfilesModule } from './profiles/profiles.module';
       // on every miss (500 instead of 404). A RegExp is handled natively
       // at runtime (cast: this version's typings only declare string[]).
       exclude: [/^\/api\//] as unknown as string[],
+      serveStaticOptions: {
+        // Entry files must never cache: a stale index.html boots a stale
+        // bundle (the classic "I don't see the new UI" bug). Hashed assets
+        // are content-addressed, so they cache immutably instead.
+        setHeaders: (res, filePath) => {
+          if (/index\.html$|sw\.js$|manifest.*\.json$/.test(filePath)) {
+            res.setHeader('Cache-Control', 'no-store');
+          } else {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      },
     }),
     DatabaseModule,
     HealthModule,
