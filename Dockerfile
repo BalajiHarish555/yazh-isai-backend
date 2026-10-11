@@ -1,6 +1,10 @@
 # Step 1: Build stage
 FROM node:20-alpine AS builder
 
+# youtube-dl-exec refuses to install without Python 3.9+; make/g++ cover a
+# bcrypt node-gyp rebuild if no musl prebuilt is available.
+RUN apk add --no-cache python3 make g++
+
 WORKDIR /app
 
 # Copy dependency files (+ .npmrc so fresh installs use the known-good
@@ -20,6 +24,9 @@ RUN npm run build
 
 # Step 2: Production runtime stage
 FROM node:20-alpine AS runner
+
+# Same install-time requirements as the builder stage
+RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 
