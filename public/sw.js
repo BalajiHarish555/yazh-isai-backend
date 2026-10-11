@@ -45,6 +45,62 @@ self.addEventListener('fetch', (event) => {
   // API: network only (fast-staling data).
   if (url.pathname.startsWith('/api/')) return;
 
+  // Saved offline tracks: serve the blob stored by "Download" from
+  // AUDIO_CACHE, with manual Range slicing so seeking works offline.
+  // (A plain cache.match would answer 200-full to Range requests, which
+  // breaks the audio element's seeking and stalls playback.)
+  if (url.pathname.startsWith('/offline-track-')) {
+    event.respondWith(
+      caches.open(AUDIO_CACHE).then(async (cache) => {
+        const stored = await cache.match(url.pathname);
+        if (!stored) {
+          try {
+            return await fetch(request);
+          } catch {
+            return new Response(null, { status: 503 });
+          }
+        }
+        const buf = await stored.arrayBuffer();
+        const total = buf.byteLength;
+        const type = stored.headers.get('content-type') || 'audio/webm';
+        const range = request.headers.get('range');
+        if (!range) {
+          return new Response(buf, {
+            status: 200,
+            headers: {
+              'Content-Type': type,
+              'Content-Length': String(total),
+              'Accept-Ranges': 'bytes',
+            },
+          });
+        }
+        const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
+        let start = 0;
+        let end = total - 1;
+        if (m) {
+          if (m[1]) start = parseInt(m[1], 10);
+          if (m[2]) end = Math.min(parseInt(m[2], 10), total - 1);
+        }
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start >= total || end < start) {
+          return new Response(null, {
+            status: 416,
+            headers: { 'Content-Range': `bytes */${total}` },
+          });
+        }
+        return new Response(buf.slice(start, end + 1), {
+          status: 206,
+          headers: {
+            'Content-Type': type,
+            'Content-Length': String(end - start + 1),
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+          },
+        });
+      }),
+    );
+    return;
+  }
+
   const isAudio =
     /\.(mp3|mp4|m4a|webm|ogg|wav|flac)(\?|$)/i.test(url.pathname) ||
     url.hostname.includes('googlevideo.com') ||
