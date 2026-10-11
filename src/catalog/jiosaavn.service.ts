@@ -303,7 +303,7 @@ export class JioSaavnService {
     const cleanTitle = this.normalizeTitle(title);
     if (!cleanTitle) return [];
     const normArtist = this.normName(artist);
-    const cacheKey = `saavn_autoplay_v3_${cleanTitle}_${normArtist.slice(0, 48)}_${this.shortHash(normArtist)}`;
+    const cacheKey = `saavn_autoplay_v4_${cleanTitle}_${normArtist.slice(0, 48)}_${this.shortHash(normArtist)}`;
     const cached = await this.cacheService.get<any[]>(cacheKey);
     if (cached && cached.length > 0) {
       this.logger.log(`Saavn autoplay cache hit: ${title} - ${artist}`);
@@ -371,15 +371,27 @@ export class JioSaavnService {
           ? primaries.join(', ')
           : (item?.subtitle || '').split(' - ')[0].split('•')[0].trim();
         let score = 0;
+        let reason = '';
+        const displayCase = (s: string) => s.replace(/\b\w/g, (c) => c.toUpperCase());
         // Same movie/album: the strongest film-music signal.
-        if (refMovie && this.movieOf(item) === refMovie) score += 5;
+        if (refMovie && this.movieOf(item) === refMovie) {
+          score += 5;
+          reason = `More from ${displayCase(refMovie)}`;
+        }
         // Same music director.
-        if (refDirector && this.directorOf(item) === refDirector) score += 4;
+        if (refDirector && this.directorOf(item) === refDirector) {
+          score += 4;
+          if (!reason) reason = `More by ${displayCase(refDirector)}`;
+        }
         // Shared singers.
         const gotSingers = this.singersOf(item);
         let singerHits = 0;
+        let sharedSinger = '';
         for (const s of refSingers) {
-          if (gotSingers.includes(s) && singerHits < 2) singerHits++;
+          if (gotSingers.includes(s) && singerHits < 2) {
+            singerHits++;
+            if (!sharedSinger) sharedSinger = s;
+          }
         }
         if (singerHits === 0) {
           const haystack = `${itemTitle} ${gotSingers.join(' ')}`;
@@ -408,12 +420,20 @@ export class JioSaavnService {
           else if (gap <= 7) score += 1;
         }
         if (score < 2) continue;
+        if (!reason) {
+          reason = sharedSinger
+            ? `More from ${displayCase(sharedSinger)}`
+            : seedLang
+              ? `Similar ${seedLang} songs`
+              : 'Similar songs';
+        }
         const entry: any = {
           id: `saavn-${item.id}`,
           title: this.decodeEntities((item?.title || '').trim()),
           artists: artists || 'Unknown Artist',
           thumbnail: (item?.image || '').replace('150x150', '500x500').replace('50x50', '500x500'),
           source: 'Autoplay • JioSaavn',
+          reason,
         };
         // Attach a verified-quality stream URL when the track offers 320.
         if (more['320kbps'] === 'true' && more.encrypted_media_url) {

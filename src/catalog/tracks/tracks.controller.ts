@@ -206,6 +206,7 @@ export class TracksController {
           const key = norm(t.title);
           if (key && !seen.has(key)) {
             seen.add(key);
+            if (!t.reason) t.reason = `More by ${cleanArtist}`;
             out.push(t);
           }
         }
