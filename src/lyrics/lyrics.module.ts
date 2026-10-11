@@ -3,7 +3,7 @@ import { LyricsService } from './lyrics.service';
 import { LyricsController } from './lyrics.controller';
 import { CacheModule } from '../common/cache.module';
 import { LrcLibLyricsProvider } from './providers/lrclib.provider';
-import { BetterLyricsLyricsProvider } from './providers/betterlyrics.provider';
+import { KuGouLyricsProvider } from './providers/kugou.provider';
 import { LyricsOvhLyricsProvider } from './providers/lyricsovh.provider';
 
 @Module({
@@ -12,7 +12,7 @@ import { LyricsOvhLyricsProvider } from './providers/lyricsovh.provider';
   providers: [
     LyricsService,
     LrcLibLyricsProvider,
-    BetterLyricsLyricsProvider,
+    KuGouLyricsProvider,
     LyricsOvhLyricsProvider,
   ],
   exports: [LyricsService],

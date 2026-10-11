@@ -1,19 +1,55 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
+import helmet from 'helmet';
+import { getJwtSecret } from './auth/jwt-secret.util';
 
-// Never let a stray unhandled rejection kill the server in production.
-// (A ytdl-core rejection once crashed the process on a routine play request.)
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled promise rejection (logged, server kept alive):', reason);
 });
 
+function validateEnv() {
+  getJwtSecret();
+  if (process.env.NODE_ENV === 'production') {
+    if (!process.env.DATABASE_URL) {
+      throw new Error('DATABASE_URL is required in production');
+    }
+    if (!process.env.CORS_ORIGIN) {
+      throw new Error('CORS_ORIGIN must be set in production');
+    }
+  }
+}
+
 async function bootstrap() {
+  validateEnv();
   const app = await NestFactory.create(AppModule);
-  
+
   app.setGlobalPrefix('api/v1');
+  app.use(
+    helmet({
+      contentSecurityPolicy: false,
+      crossOriginResourcePolicy: { policy: 'cross-origin' },
+    }),
+  );
+
+  const isProduction = process.env.NODE_ENV === 'production';
+  const allowedOrigins = (process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // Render injects RENDER_EXTERNAL_URL (https://<service>.onrender.com).
+  // Same-origin cloud deploys stay working with zero extra config.
+  if (process.env.RENDER_EXTERNAL_URL) {
+    allowedOrigins.push(process.env.RENDER_EXTERNAL_URL);
+  }
+
   app.enableCors({
-    origin: '*',
+    origin: allowedOrigins.length > 0
+      ? allowedOrigins
+      : isProduction
+        ? false
+        : true,
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     credentials: true,
   });
@@ -23,6 +59,15 @@ async function bootstrap() {
     transform: true,
     forbidNonWhitelisted: true,
   }));
+
+  const swaggerConfig = new DocumentBuilder()
+    .setTitle('Yazh Isai API')
+    .setDescription('Music Intelligence Core: catalog, streaming, lyrics, library, profiles')
+    .setVersion('1.0.0')
+    .addBearerAuth()
+    .build();
+  const swaggerDoc = SwaggerModule.createDocument(app, swaggerConfig);
+  SwaggerModule.setup('api/docs', app, swaggerDoc);
 
   const port = process.env.PORT || 5000;
   await app.listen(port, '0.0.0.0');

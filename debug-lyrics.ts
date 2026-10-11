@@ -1,6 +1,6 @@
 import { LyricsService } from './src/lyrics/lyrics.service';
 import { CacheService } from './src/common/cache.service';
-import { BetterLyricsLyricsProvider } from './src/lyrics/providers/betterlyrics.provider';
+import { KuGouLyricsProvider } from './src/lyrics/providers/kugou.provider';
 import { LrcLibLyricsProvider } from './src/lyrics/providers/lrclib.provider';
 import { LyricsOvhLyricsProvider } from './src/lyrics/providers/lyricsovh.provider';
 
@@ -34,7 +34,7 @@ async function debugLyricsService() {
   
   // Initialize providers in order of preference (same as in LyricsService)
   const providers = [
-    new BetterLyricsLyricsProvider(),
+    new KuGouLyricsProvider(),
     new LrcLibLyricsProvider(),
     new LyricsOvhLyricsProvider(),
   ];

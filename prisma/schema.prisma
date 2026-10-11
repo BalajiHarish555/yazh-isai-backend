@@ -3,9 +3,9 @@ generator prisma {
 }
 
 datasource db {
-  // PostgreSQL everywhere: Render/Neon in cloud, and local dev points at
-  // the same cloud DB (see .env). SQLite can't survive cloud deploys
-  // (ephemeral disk), so a single provider keeps migrate deploy honest.
+  // PostgreSQL everywhere: local dev runs on the bundled pgserver instance
+  // (see scripts/local-pg.py), cloud runs on Render/Neon Postgres. One
+  // provider keeps `migrate deploy` honest in both places.
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
@@ -25,7 +25,9 @@ model User {
   likedAlbums     LikedAlbum[]
   followedArtists FollowedArtist[]
   playlists       Playlist[]
+  sharedPlaylists SharedPlaylist[]
   history         ListeningEvent[]
+  refreshTokens   RefreshToken[]
 }
 
 model Profile {
@@ -159,6 +161,20 @@ model PlaylistTrack {
   @@unique([playlistId, trackId])
 }
 
+model SharedPlaylist {
+  // Public share links for local-first playlists. Tracks are plain Song
+  // snapshots (any source: YouTube ids, local files) because relational
+  // PlaylistTrack rows FK to the catalog Track table.
+  id        String   @id @default(uuid())
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name      String
+  tracks    String
+  createdAt DateTime @default(now())
+
+  @@index([ownerId])
+}
+
 model LikedTrack {
   userId    String
   trackId   String
@@ -167,6 +183,8 @@ model LikedTrack {
   createdAt DateTime @default(now())
 
   @@id([userId, trackId])
+  @@index([userId])
+  @@index([trackId])
 }
 
 model LikedAlbum {
@@ -177,6 +195,8 @@ model LikedAlbum {
   createdAt DateTime @default(now())
 
   @@id([userId, albumId])
+  @@index([userId])
+  @@index([albumId])
 }
 
 model FollowedArtist {
@@ -187,6 +207,22 @@ model FollowedArtist {
   createdAt DateTime @default(now())
 
   @@id([userId, artistId])
+  @@index([userId])
+  @@index([artistId])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  hashedToken String   @unique
+  expiresAt  DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([hashedToken])
 }
 
 model ListeningEvent {

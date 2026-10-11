@@ -18,3 +18,8 @@ services:
           property: connectionString
       - key: JWT_SECRET
         generateValue: true
+      # Custom-domain frontend origin, if the SPA is served elsewhere.
+      # Same-origin deploys need nothing: RENDER_EXTERNAL_URL is allowlisted
+      # automatically (see src/main.ts).
+      - key: CORS_ORIGIN
+        value: ""

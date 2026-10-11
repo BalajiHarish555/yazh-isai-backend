@@ -1,0 +1,21 @@
+{
+  "short_name": "Yazh Isai",
+  "name": "Yazh Isai Music",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#08090C",
+  "theme_color": "#08090C",
+  "display": "standalone",
+  "orientation": "portrait"
+}

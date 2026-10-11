@@ -15,7 +15,7 @@ export class YouTubeMusicService {
     private jioSaavnService: JioSaavnService,
   ) {}
 
-  async getAudioStreamDetails(videoId: string): Promise<{
+  async getAudioStreamDetails(videoId: string, title?: string, artist?: string, quality?: string): Promise<{
     streamUrl: string;
     bitrate: number;
     codec: string;
@@ -105,20 +105,72 @@ export class YouTubeMusicService {
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms)),
         ]);
 
-      let details: any = null;
-      try {
-        details = await withTimeout(resolveViaYtDlp(), 20000);
-      } catch (error: any) {
-        this.logger.warn(`youtube-dl-exec failed for ${videoId} (${error?.message || error}), trying ytdl-core fallback`);
+      // Race all resolvers: first SUCCESS wins. JioSaavn 320kbps direct CDN
+      // URLs resolve in ~1-3s (plain API call, no process spawn) and usually
+      // beat yt-dlp's ~9s cold start for Tamil/film songs; yt-dlp stays the
+      // reliable fallback, ytdl-core the quick third lane. Every promise is
+      // observed from birth (never an unhandled rejection), losers ignored.
+      const racers: Array<Promise<any>> = [];
+      // Saver mode skips the 320kbps lane on purpose: ~160kbps Opus uses
+      // roughly half the bandwidth. 'best' (default) races everything.
+      const saver = (quality || '').toLowerCase() === 'saver';
+      if (title && !saver) {
+        const saavnAttempt = (async () => {
+          try {
+            const s = await withTimeout(
+              this.jioSaavnService.getBestStream(title, artist || ''),
+              12000,
+            );
+            if (!s?.streamUrl) return null;
+            return {
+              streamUrl: s.streamUrl,
+              bitrate: s.bitrate,
+              codec: s.codec,
+              mimeType: s.mimeType,
+              qualityLabel: s.qualityLabel,
+              quality: s.quality,
+              isLossless: false,
+              source: s.source,
+            };
+          } catch {
+            return null;
+          }
+        })();
+        racers.push(saavnAttempt);
       }
-
-      if (!details) {
-        try {
-          details = await withTimeout(resolveViaYtdlCore(), 6000);
-        } catch (error: any) {
+      racers.push(
+        withTimeout(resolveViaYtDlp(), 20000).catch((error: any) => {
+          this.logger.warn(`youtube-dl-exec failed for ${videoId} (${error?.message || error})`);
+          return null;
+        }),
+        withTimeout(resolveViaYtdlCore(), 8000).catch((error: any) => {
           this.logger.warn(`ytdl-core fallback failed for ${videoId} (${error?.message || error})`);
-        }
-      }
+          return null;
+        }),
+      );
+      const tags = title && !saver
+        ? ['saavn-320', 'yt-dlp', 'ytdl-core']
+        : ['yt-dlp', 'ytdl-core'];
+      let details: any = null;
+      let pending = racers.length;
+      let done = false;
+      details = await new Promise<any>((resolve) => {
+        const onWin = (d: any, tag: string) => {
+          if (done) return;
+          if (d) {
+            done = true;
+            this.logger.log(`${tag} won for ${videoId}`);
+            resolve(d);
+            return;
+          }
+          pending -= 1;
+          if (pending === 0) {
+            done = true;
+            resolve(null);
+          }
+        };
+        racers.forEach((p, i) => p.then((d) => onWin(d, tags[i] || `racer-${i}`)));
+      });
 
       if (details) {
         await this.cacheService.set(cacheKey, details, 1800);

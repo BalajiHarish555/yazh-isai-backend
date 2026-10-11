@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import fetch from 'node-fetch';
-import * as forge from 'node-forge';
+import { desEcbDecrypt } from '../common/des';
 import { CacheService } from '../common/cache.service';
 
 export interface SaavnStreamDetails {
@@ -55,12 +55,13 @@ export class JioSaavnService {
 
   private decryptMediaUrl(encrypted: string): string | null {
     try {
-      const decipher = forge.cipher.createDecipher('DES-ECB', forge.util.createBuffer(MEDIA_KEY));
-      decipher.start({ iv: '' } as any);
-      decipher.update(forge.util.createBuffer(forge.util.decode64(encrypted)));
-      const ok = decipher.finish();
-      if (!ok) return null;
-      return decipher.output.toString().trim() || null;
+      const raw = Buffer.from(encrypted, 'base64');
+      if (raw.length === 0 || raw.length % 8 !== 0) return null;
+      const text = Buffer.from(
+        desEcbDecrypt([...MEDIA_KEY].map((c) => c.charCodeAt(0)), raw),
+      ).toString('utf8');
+      const cleaned = text.replace(/[\0\s]+$/g, '').trim();
+      return cleaned || null;
     } catch (error: any) {
       this.logger.log(`Saavn URL decrypt failed: ${error?.message || error}`);
       return null;
@@ -215,6 +216,213 @@ export class JioSaavnService {
       .replace(/&#0*39;/g, "'")
       .replace(/&amp;/g, '&')
       .replace(/&nbsp;/g, ' ');
+  }
+
+  private normName(s: string): string {
+    return (s || '')
+      .toLowerCase()
+      .replace(/\(.*?\)/g, ' ')
+      .replace(/[^a-z0-9\u0B80-\u0BFF ]/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** Persons (singers) listed in a bundled artist string. */
+  private personNames(artist: string): string[] {
+    const out: string[] = [];
+    for (const part of (artist || '').split('•')[0].split(/[,;&|/]+/)) {
+      const cleaned = part
+        .replace(/\s+(?:feat\.?|ft\.?|featuring)\s+.*$/i, '')
+        .trim();
+      const norm = this.normName(cleaned);
+      if (norm.length > 2) out.push(norm);
+    }
+    return [...new Set(out)];
+  }
+
+  /** Movie/album tail of a bundled artist string ("A, B • Maryan (OST)"). */
+  private movieName(artist: string, subtitle = ''): string {
+    const tails: string[] = [];
+    const parts = (artist || '').split('•').slice(1);
+    for (const p of parts) {
+      const m = this.normName(p.replace(/\d{1,2}:\d{2}/g, ' '));
+      if (m.length > 2) tails.push(m);
+    }
+    if (tails.length > 0) return tails[0];
+    const sub = (subtitle || '').split(' - ')[1] || '';
+    return this.normName(sub);
+  }
+
+  private singersOf(item: any): string[] {
+    const names: string[] = [];
+    const push = (n: string) => {
+      const norm = this.normName(n);
+      if (norm.length > 2 && !names.includes(norm)) names.push(norm);
+    };
+    const more = item?.more_info || {};
+    for (const a of more.artistMap?.primary_artists || []) push(a?.name || '');
+    for (const a of more.artistMap?.featured_artists || []) push(a?.name || '');
+    for (const p of ((item?.subtitle || '').split(' - ')[0] || '').split(/[,;&|/]+/)) push(p);
+    return names;
+  }
+
+  private directorOf(item: any): string {
+    const more = item?.more_info || {};
+    if (typeof more.music === 'string' && more.music.trim()) {
+      return this.normName(more.music.split(',')[0]);
+    }
+    const artists = more.artistMap?.artists || [];
+    const found = artists.find((a: any) => (a?.role || '').toLowerCase() === 'music');
+    return this.normName(found?.name || '');
+  }
+
+  private movieOf(item: any): string {
+    const more = item?.more_info || {};
+    if (typeof more.album === 'string' && more.album.trim()) {
+      return this.normName(more.album);
+    }
+    return this.movieName('', item?.subtitle || '');
+  }
+
+  /**
+   * Related-track autoplay pool. First resolves the CURRENT song on Saavn
+   * to learn its ground truth (movie, music director, singers), then ranks
+   * candidates the way film-music listeners think: same movie first, then
+   * same director, then shared singers, then language.
+   */
+  async getAutoplaySeeds(title: string, artist: string, limit = 10): Promise<any[]> {
+    const cleanTitle = this.normalizeTitle(title);
+    if (!cleanTitle) return [];
+    const cacheKey = `saavn_autoplay_v2_${cleanTitle}_${this.normName(artist).slice(0, 60)}`;
+    const cached = await this.cacheService.get<any[]>(cacheKey);
+    if (cached && cached.length > 0) {
+      this.logger.log(`Saavn autoplay cache hit: ${title} - ${artist}`);
+      return cached.slice(0, limit);
+    }
+
+    const wantSingers = this.personNames(artist);
+    const wantMovie = this.movieName(artist);
+    const wantLang = /[\u0B80-\u0BFF]/.test(title || '') ? 'tamil' : '';
+    const primary = this.primaryArtist(artist);
+
+    const yearOf = (item: any): number => {
+      const raw = String(item?.year || item?.more_info?.release_date || '').match(/\d{4}/);
+      const y = raw ? parseInt(raw[0], 10) : 0;
+      return y > 1900 && y < 2100 ? y : 0;
+    };
+
+    // Ground truth for the current track: movie + director + singers + era + language.
+    let refMovie = wantMovie;
+    let refDirector = '';
+    let refSingers = wantSingers;
+    let refYear = 0;
+    let refLang = '';
+    try {
+      const refData = await this.fetchJson(
+        `${SAAVN_API}?__call=search.getResults&q=${encodeURIComponent(`${cleanTitle} ${primary}`.trim())}&p=1&n=3&_format=json&_marker=0&api_version=4&ctx=web6dot0`,
+      );
+      const refResults: any[] = refData?.results || [];
+      const refRanked = refResults
+        .map((item) => ({ item, score: this.scoreCandidate(item, cleanTitle, this.artistTokens(artist)) }))
+        .sort((a, b) => b.score - a.score);
+      const ref = refRanked.length > 0 && refRanked[0].score >= 4 ? refRanked[0].item : null;
+      if (ref) {
+        const m = this.movieOf(ref);
+        if (m) refMovie = m;
+        const d = this.directorOf(ref);
+        if (d) refDirector = d;
+        const s = this.singersOf(ref);
+        if (s.length > 0) refSingers = s;
+        const y = yearOf(ref);
+        if (y) refYear = y;
+        const rl = String(ref?.language || '').toLowerCase();
+        if (rl && rl !== 'unknown' && rl !== 'other') refLang = rl;
+      }
+    } catch {
+      // Reference lookup is an optimization; matching still works without it.
+    }
+
+    const queries = primary ? [`${primary} top songs`, primary] : [cleanTitle];
+    if (refMovie) queries.push(refMovie);
+    const scored: Array<{ entry: any; score: number }> = [];
+    const seen = new Set<string>();
+    for (const q of queries.slice(0, 3)) {
+      const data = await this.fetchJson(
+        `${SAAVN_API}?__call=search.getResults&q=${encodeURIComponent(q)}&p=1&n=10&_format=json&_marker=0&api_version=4&ctx=web6dot0`,
+      );
+      const results: any[] = data?.results || [];
+      for (const item of results) {
+        const itemTitle = this.normalizeTitle(item?.title || '');
+        if (!itemTitle || itemTitle === cleanTitle || seen.has(itemTitle)) continue;
+        seen.add(itemTitle);
+        const more = item?.more_info || {};
+        const primaries: string[] = (more.artistMap?.primary_artists || []).map((a: any) => a?.name).filter(Boolean);
+        const artists = primaries.length > 0
+          ? primaries.join(', ')
+          : (item?.subtitle || '').split(' - ')[0].split('•')[0].trim();
+        let score = 0;
+        // Same movie/album: the strongest film-music signal.
+        if (refMovie && this.movieOf(item) === refMovie) score += 5;
+        // Same music director.
+        if (refDirector && this.directorOf(item) === refDirector) score += 4;
+        // Shared singers.
+        const gotSingers = this.singersOf(item);
+        let singerHits = 0;
+        for (const s of refSingers) {
+          if (gotSingers.includes(s) && singerHits < 2) singerHits++;
+        }
+        if (singerHits === 0) {
+          const haystack = `${itemTitle} ${gotSingers.join(' ')}`;
+          for (const token of this.artistTokens(artist)) {
+            if (token.length > 2 && haystack.includes(token)) {
+              singerHits = 1;
+              break;
+            }
+          }
+        }
+        score += singerHits * 2;
+        // Strict language filter: match the seed song's own language, learned
+        // from the resolved reference track (input titles are usually Latin
+        // script, so script-sniffing the query alone misses Tamil seeds).
+        const seedLang = refLang || wantLang;
+        const lang = (item?.language || '').toLowerCase();
+        if (seedLang && lang && lang !== seedLang && lang !== 'unknown' && lang !== 'other') {
+          continue;
+        }
+        if (seedLang && lang === seedLang) score += 3;
+        // Same era: film-music taste clusters by generation (±3y strong).
+        const candYear = yearOf(item);
+        if (refYear && candYear) {
+          const gap = Math.abs(refYear - candYear);
+          if (gap <= 3) score += 2;
+          else if (gap <= 7) score += 1;
+        }
+        if (score < 2) continue;
+        const entry: any = {
+          id: `saavn-${item.id}`,
+          title: this.decodeEntities((item?.title || '').trim()),
+          artists: artists || 'Unknown Artist',
+          thumbnail: (item?.image || '').replace('150x150', '500x500').replace('50x50', '500x500'),
+          source: 'Autoplay • JioSaavn',
+        };
+        // Attach a verified-quality stream URL when the track offers 320.
+        if (more['320kbps'] === 'true' && more.encrypted_media_url) {
+          const raw = this.decryptMediaUrl(more.encrypted_media_url);
+          const url320 = raw ? raw.replace('_96.mp4', '_320.mp4') : null;
+          if (url320 && url320 !== raw) {
+            entry.streamUrl = url320;
+            entry.audioQuality = '320kbps AAC (High)';
+          }
+        }
+        scored.push({ entry, score });
+      }
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const out = scored.slice(0, limit).map((s) => s.entry);
+    if (out.length > 0) {
+      await this.cacheService.set(cacheKey, out, 3600);
+    }
+    return out;
   }
 
   private mapTrendingSong(item: any): {

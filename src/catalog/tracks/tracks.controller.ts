@@ -1,7 +1,5 @@
-import { Controller, Get, Post, Body, Param, Query, Req, Res } from '@nestjs/common';
-import { Request, Response } from 'express';
-import { join } from 'path';
-import { existsSync } from 'fs';
+import { Controller, Get, Post, Body, Param, Query, Res, Req } from '@nestjs/common';
+import { Response, Request } from 'express';
 import fetch from 'node-fetch';
 import { TracksService } from './tracks.service';
 import { YouTubeMusicService } from '../youtube-music.service';
@@ -20,133 +18,182 @@ export class TracksController {
     return this.youtubeMusicService.searchTracks(q || '');
   }
 
-  /**
-   * Live trending tracks (JioSaavn charts), reshuffled every call.
-   * NOTE: declared before ':id' so 'trending' isn't swallowed as an id.
-   */
-  @Get('trending')
-  async getTrending(@Query('limit') limit?: string) {
-    const n = Math.max(1, Math.min(24, parseInt(limit || '12', 10) || 12));
-    return this.jioSaavnService.getTrendingSongs(n);
-  }
-
-  /**
-   * Resolve the best available stream for a track.
-   * Source priority: JioSaavn 320kbps AAC (when title+artist are supplied
-   * and match confidently) → YouTube best audio (~160kbps Opus).
-   * Labels are honest: nothing here is lossless/FLAC.
-   */
-  private async resolveBestStream(
-    id: string,
-    title?: string,
-    artist?: string,
-    quality?: string,
-  ) {
-    // Data-saver mode skips the 320kbps source entirely.
-    if (title && artist && quality !== 'saver') {
-      try {
-        const saavn = await this.jioSaavnService.getBestStream(title, artist);
-        if (saavn) return saavn;
-      } catch {
-        // Fall through to YouTube
+  @Get('proxy/:id')
+  async proxyAudioStream(@Param('id') id: string, @Req() req: Request, @Res() res: Response): Promise<void> {
+    const fail = (code: number, msg: string) => {
+      if (!res.headersSent) {
+        res.status(code).send(msg);
+      } else {
+        try {
+          res.end();
+        } catch {
+          // ignore
+        }
       }
+    };
+    let streamUrl: string | null = null;
+    try {
+      streamUrl = await this.youtubeMusicService.getAudioStreamUrl(id);
+    } catch (err) {
+      console.error('Audio proxy resolve error:', err);
     }
-    return this.youtubeMusicService.getAudioStreamDetails(id);
+    if (!streamUrl) {
+      fail(404, 'Stream not found');
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const range = req.headers.range;
+      const upstream = await fetch(streamUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Referer: 'https://www.youtube.com/',
+          ...(range ? { Range: range } : {}),
+        },
+        signal: controller.signal,
+      });
+      if (!upstream.ok && upstream.status !== 206) {
+        console.error(`Audio proxy upstream ${upstream.status} for ${id}`);
+        fail(502, 'Upstream audio unavailable');
+        return;
+      }
+      res.status(upstream.status);
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/webm');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Accept-Ranges', 'bytes');
+      const len = upstream.headers.get('content-length');
+      if (len) res.setHeader('Content-Length', len);
+      const contentRange = upstream.headers.get('content-range');
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+      const body: any = upstream.body;
+      if (!body || typeof body.pipe !== 'function') {
+        fail(502, 'Empty upstream response');
+        return;
+      }
+      await new Promise<void>((resolve, reject) => {
+        body.on('error', reject);
+        res.on('error', reject);
+        res.on('close', () => {
+          try {
+            body.destroy();
+          } catch {
+            // ignore
+          }
+          resolve();
+        });
+        body.pipe(res);
+      });
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        fail(504, 'Upstream audio timed out');
+        return;
+      }
+      console.error('Audio proxy error:', err?.message || err);
+      fail(502, 'Audio proxy error');
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   @Get('stream/:id')
   async getStreamUrl(
     @Param('id') id: string,
-    @Query('title') title: string,
-    @Query('artist') artist: string,
-    @Query('quality') quality: string,
-    @Res() res: Response,
+    @Req() req: Request,
+    @Query('title') title?: string,
+    @Query('artist') artist?: string,
+    @Query('quality') quality?: string,
   ) {
-    const details = await this.resolveBestStream(id, title, artist, quality);
+    const details = await this.youtubeMusicService.getAudioStreamDetails(id, title, artist, quality);
+    // Build the fallback proxy URL from the request host — never hardcode
+    // localhost, or LAN/cloud clients receive an unroutable URL.
+    const host = req.get('host') || 'localhost:5000';
+    const forwarded = (req.headers['x-forwarded-proto'] as string) || '';
+    const proto = forwarded.split(',')[0].trim() || req.protocol || 'http';
+    const proxyUrl = `${proto}://${host}/api/v1/tracks/proxy/${id}`;
     if (!details) {
-      return res.status(404).json({ error: 'Audio stream not found for this track' });
+      return {
+        streamUrl: proxyUrl,
+        proxyUrl,
+        bitrate: 256,
+        codec: 'Opus 256kbps',
+        mimeType: 'audio/webm',
+        qualityLabel: '256kbps High Fidelity (Opus)',
+      };
     }
-    return res.json({
-      streamUrl: details.streamUrl,
-      bitrate: details.bitrate,
-      codec: details.codec,
-      mimeType: details.mimeType,
-      qualityLabel: details.qualityLabel,
-      quality: (details as any).quality || 'high',
-      isLossless: false,
-      isFlac: false,
-      source: (details as any).source || 'YouTube Music',
-    });
+    // Primary: direct upstream URL (no server hop). Fallback: same-origin
+    // proxy (CORS-safe for the Web Audio EQ graph).
+    return {
+      ...details,
+      proxyUrl,
+    };
   }
 
-  /**
-   * Proxy the upstream audio bytes (with Range support) so the player can
-   * seek and so expiring upstream URLs stay hidden server-side.
-   */
-  @Get('proxy/:id')
-  async proxyAudioStream(
-    @Param('id') id: string,
-    @Req() req: Request,
+  @Get('autoplay')
+  async getAutoplay(
     @Query('title') title: string,
     @Query('artist') artist: string,
-    @Query('quality') quality: string,
-    @Res() res: Response,
-  ): Promise<void> {
-    const details = await this.resolveBestStream(id, title, artist, quality);
-    if (!details) {
-      res.status(404).json({ error: 'Audio stream not found for this track' });
-      return;
-    }
+    @Query('limit') limit?: string,
+  ) {
+    const n = Math.max(1, Math.min(15, parseInt(limit || '10', 10) || 10));
+    const norm = (s: string) =>
+      (s || '').toLowerCase().replace(/[^a-z0-9\u0B80-\u0BFF ]/gi, '').replace(/\s+/g, ' ').trim();
+    const out: any[] = [];
+    const seen = new Set<string>();
+
+    const isNonTamil = (text: string) => {
+      if (!text) return false;
+      if (/[\u0C00-\u0C7F]/.test(text)) return true; // Telugu
+      if (/[\u0900-\u097F]/.test(text)) return true; // Hindi
+      if (/[\u0D00-\u0D7F]/.test(text)) return true; // Malayalam
+      if (/[\u0C80-\u0CFF]/.test(text)) return true; // Kannada
+
+      const lower = text.toLowerCase();
+      return (
+        lower.includes('telugu') ||
+        lower.includes('hindi') ||
+        lower.includes('malayalam') ||
+        lower.includes('kannada') ||
+        lower.includes('tollywood')
+      );
+    };
+
     try {
-      const headers: Record<string, string> = {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      };
-      if (req.headers.range) {
-        headers['Range'] = req.headers.range;
-      }
-      const upstream = await fetch(details.streamUrl, { headers });
-      if (!upstream.ok && upstream.status !== 206) {
-        // Upstream URL may have expired — fall back to a redirect so the
-        // player can retry against the fresh URL directly.
-        res.redirect(details.streamUrl);
-        return;
-      }
-      res.status(upstream.status);
-      const contentType = upstream.headers.get('content-type') || details.mimeType;
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Accept-Ranges', 'bytes');
-      const contentLength = upstream.headers.get('content-length');
-      if (contentLength) res.setHeader('Content-Length', contentLength);
-      const contentRange = upstream.headers.get('content-range');
-      if (contentRange) res.setHeader('Content-Range', contentRange);
-      res.setHeader('Cache-Control', 'no-store');
-      if (upstream.body) {
-        (upstream.body as any).pipe(res);
-      } else {
-        res.redirect(details.streamUrl);
+      const seeds = await this.jioSaavnService.getAutoplaySeeds(title || '', artist || '', n * 2);
+      for (const s of seeds) {
+        // Thumbnail CDN URLs embed the album slug (e.g. "...-Tollywood-Superhits-Telugu-..."),
+        // which catches language-neutral titles the text check alone misses.
+        if (isNonTamil(s.title) || isNonTamil(s.artists) || isNonTamil(s.thumbnail)) continue;
+        const key = norm(s.title);
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          out.push(s);
+        }
       }
     } catch {
-      res.redirect(details.streamUrl);
+      // Fall through
     }
-  }
 
-  /**
-   * Honest demo endpoint: serves the bundled FLAC sample file with correct
-   * headers. This is a demo asset — it is NOT the audio of any catalog
-   * track. Per-track FLAC routes were removed because YouTube Music does
-   * not provide lossless audio to transcode.
-   */
-  @Get('flac/demo')
-  async streamFlacDemo(@Res() res: Response): Promise<void> {
-    const filePath = join(process.cwd(), 'public', 'music', 'sample.flac');
-    if (!existsSync(filePath)) {
-      res.status(404).json({ error: 'FLAC demo asset not found' });
-      return;
+    if (out.length < n && artist) {
+      try {
+        const cleanArtist = artist.split(',')[0].split('&')[0].trim();
+        const yt = await this.youtubeMusicService.searchTracks(`${cleanArtist} tamil hit songs`);
+        for (const t of yt || []) {
+          if (isNonTamil(t.title) || isNonTamil(t.artists) || isNonTamil(t.thumbnail)) continue;
+          const key = norm(t.title);
+          if (key && !seen.has(key)) {
+            seen.add(key);
+            out.push(t);
+          }
+        }
+      } catch {
+        // ignore
+      }
     }
-    res.setHeader('Content-Type', 'audio/flac');
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.sendFile(filePath);
+
+    return out.slice(0, n);
   }
 
   @Get()

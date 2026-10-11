@@ -133,6 +133,17 @@ CREATE TABLE "PlaylistTrack" (
 );
 
 -- CreateTable
+CREATE TABLE "SharedPlaylist" (
+    "id" TEXT NOT NULL,
+    "ownerId" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "tracks" TEXT NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT "SharedPlaylist_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateTable
 CREATE TABLE "LikedTrack" (
     "userId" TEXT NOT NULL,
     "trackId" TEXT NOT NULL,
@@ -157,6 +168,19 @@ CREATE TABLE "FollowedArtist" (
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT "FollowedArtist_pkey" PRIMARY KEY ("userId","artistId")
+);
+
+-- CreateTable
+CREATE TABLE "RefreshToken" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT NOT NULL,
+    "hashedToken" TEXT NOT NULL,
+    "expiresAt" TIMESTAMP(3) NOT NULL,
+    "revoked" BOOLEAN NOT NULL DEFAULT false,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "RefreshToken_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -198,6 +222,36 @@ CREATE INDEX "Track_title_idx" ON "Track"("title");
 CREATE UNIQUE INDEX "PlaylistTrack_playlistId_trackId_key" ON "PlaylistTrack"("playlistId", "trackId");
 
 -- CreateIndex
+CREATE INDEX "SharedPlaylist_ownerId_idx" ON "SharedPlaylist"("ownerId");
+
+-- CreateIndex
+CREATE INDEX "LikedTrack_userId_idx" ON "LikedTrack"("userId");
+
+-- CreateIndex
+CREATE INDEX "LikedTrack_trackId_idx" ON "LikedTrack"("trackId");
+
+-- CreateIndex
+CREATE INDEX "LikedAlbum_userId_idx" ON "LikedAlbum"("userId");
+
+-- CreateIndex
+CREATE INDEX "LikedAlbum_albumId_idx" ON "LikedAlbum"("albumId");
+
+-- CreateIndex
+CREATE INDEX "FollowedArtist_userId_idx" ON "FollowedArtist"("userId");
+
+-- CreateIndex
+CREATE INDEX "FollowedArtist_artistId_idx" ON "FollowedArtist"("artistId");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "RefreshToken_hashedToken_key" ON "RefreshToken"("hashedToken");
+
+-- CreateIndex
+CREATE INDEX "RefreshToken_userId_idx" ON "RefreshToken"("userId");
+
+-- CreateIndex
+CREATE INDEX "RefreshToken_hashedToken_idx" ON "RefreshToken"("hashedToken");
+
+-- CreateIndex
 CREATE INDEX "ListeningEvent_userId_idx" ON "ListeningEvent"("userId");
 
 -- CreateIndex
@@ -231,6 +285,9 @@ ALTER TABLE "PlaylistTrack" ADD CONSTRAINT "PlaylistTrack_playlistId_fkey" FOREI
 ALTER TABLE "PlaylistTrack" ADD CONSTRAINT "PlaylistTrack_trackId_fkey" FOREIGN KEY ("trackId") REFERENCES "Track"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
+ALTER TABLE "SharedPlaylist" ADD CONSTRAINT "SharedPlaylist_ownerId_fkey" FOREIGN KEY ("ownerId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
 ALTER TABLE "LikedTrack" ADD CONSTRAINT "LikedTrack_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
@@ -247,6 +304,9 @@ ALTER TABLE "FollowedArtist" ADD CONSTRAINT "FollowedArtist_userId_fkey" FOREIGN
 
 -- AddForeignKey
 ALTER TABLE "FollowedArtist" ADD CONSTRAINT "FollowedArtist_artistId_fkey" FOREIGN KEY ("artistId") REFERENCES "Artist"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
+-- AddForeignKey
+ALTER TABLE "RefreshToken" ADD CONSTRAINT "RefreshToken_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "ListeningEvent" ADD CONSTRAINT "ListeningEvent_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;

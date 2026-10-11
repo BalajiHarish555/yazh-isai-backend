@@ -1,4 +1,6 @@
 import { Module } from '@nestjs/common';
+import { APP_GUARD } from '@nestjs/core';
+import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { ConfigModule } from '@nestjs/config';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { join } from 'path';
@@ -21,6 +23,12 @@ import { ProfilesModule } from './profiles/profiles.module';
       isGlobal: true,
       envFilePath: '.env',
     }),
+    // Global abuse protection. Defaults are generous for normal app use;
+    // expensive routes (stream/proxy/search/lyrics) set tighter budgets
+    // via @Throttle on their controllers.
+    ThrottlerModule.forRoot({
+      throttlers: [{ name: 'default', ttl: 60000, limit: 120 }],
+    }),
     ServeStaticModule.forRoot({
       rootPath: join(__dirname, '..', 'public'),
       // NOTE: a plain '/api*' string crashes this package's path-to-regexp
@@ -42,7 +50,7 @@ import { ProfilesModule } from './profiles/profiles.module';
     ProfilesModule,
   ],
   controllers: [],
-  providers: [],
+  providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })
 export class AppModule {}
 

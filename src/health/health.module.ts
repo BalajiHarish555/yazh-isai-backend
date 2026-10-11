@@ -1,6 +1,9 @@
 import { Module } from '@nestjs/common';
 import { Controller } from '@nestjs/common';
 import { Get } from '@nestjs/common';
+import { CacheModule } from '../common/cache.module';
+import { StreamHealthController } from './stream-health.controller';
+import { StreamHealthService } from './stream-health.service';
 
 @Controller('health')
 export class HealthController {
@@ -19,6 +22,8 @@ export class HealthController {
 }
 
 @Module({
-  controllers: [HealthController],
+  imports: [CacheModule],
+  controllers: [HealthController, StreamHealthController],
+  providers: [StreamHealthService],
 })
 export class HealthModule {}

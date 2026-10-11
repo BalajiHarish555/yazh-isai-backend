@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { CacheService } from '../common/cache.service';
 import { LyricsProvider } from './lyrics.provider';
 import { LrcLibLyricsProvider } from './providers/lrclib.provider';
-import { BetterLyricsLyricsProvider } from './providers/betterlyrics.provider';
+import { KuGouLyricsProvider } from './providers/kugou.provider';
 import { LyricsOvhLyricsProvider } from './providers/lyricsovh.provider';
 import fetch from 'node-fetch';
 
@@ -18,13 +18,13 @@ export class LyricsService {
 
   constructor(private cacheService: CacheService) {
     // Initialize providers in order of preference. LrcLib is the primary
-    // source (fast, has synced+plain lyrics incl. Tamil catalog). LyricsOvh
-    // is second (fast misses). BetterLyrics is last resort — it has been
-    // observed to hang, so it is only reached when the first two miss.
+    // source (fast, synced+plain incl. Tamil catalog). KuGou is second
+    // (synced LRC via hash lookup, strong Asian catalog, no auth).
+    // LyricsOvh is the fast-miss fallback.
     this.providers = [
       new LrcLibLyricsProvider(),
+      new KuGouLyricsProvider(),
       new LyricsOvhLyricsProvider(),
-      new BetterLyricsLyricsProvider(),
     ];
   }
 
@@ -190,17 +190,12 @@ export class LyricsService {
         const queries = this.generateAlternativeQueries(artist, track);
         let found: { text: string; synced: string | null } | null = null;
 
-        // Slow last-resort providers get exactly one shot (the best query),
-        // not one slow call per variation.
-        const attempts =
-          provider.name === 'BetterLyrics' ? queries.slice(0, 1) : queries;
-
         // Try each variation until we find lyrics
-        for (const { artist: queryArtist, track: queryTrack } of attempts) {
+        for (const { artist: queryArtist, track: queryTrack } of queries) {
           if (queryArtist && queryTrack) {
             this.logger.log(`  Trying query: "${queryArtist}" - "${queryTrack}"`);
-            // LrcLib can return synced lyrics alongside the plain text.
-            if (provider.name === 'LrcLib' && 'fetchLyricsWithSync' in provider) {
+            // Providers with synced support return text + LRC together.
+            if (typeof (provider as any).fetchLyricsWithSync === 'function') {
               found = await (provider as any).fetchLyricsWithSync(queryArtist, queryTrack);
             } else {
               const text = await provider.fetchLyrics(queryArtist, queryTrack);

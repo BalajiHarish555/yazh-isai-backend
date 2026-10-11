@@ -1,6 +1,9 @@
 import { Controller, Get, Query, Param } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { LyricsService } from './lyrics.service';
 
+// Each lookup fans out to several upstream lyric APIs.
+@Throttle({ default: { limit: 60, ttl: 60000 } })
 @Controller('lyrics')
 export class LyricsController {
   constructor(private readonly lyricsService: LyricsService) {}
