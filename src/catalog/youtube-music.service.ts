@@ -99,11 +99,15 @@ export class YouTubeMusicService {
         return null;
       };
 
-      const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> =>
-        Promise.race([
-          promise,
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('Timeout')), ms)),
-        ]);
+      const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Timeout')), ms);
+        });
+        return Promise.race([promise, timeout]).finally(() => {
+          if (timer) clearTimeout(timer);
+        });
+      };
 
       // Race all resolvers: first SUCCESS wins. JioSaavn 320kbps direct CDN
       // URLs resolve in ~1-3s (plain API call, no process spawn) and usually
@@ -212,7 +216,9 @@ export class YouTubeMusicService {
 
   async searchTracks(query: string) {
     const startTime = Date.now();
-    const cacheKey = `search_${query}`;
+    // Normalize so case/whitespace variants ("Vaathi" vs "vaathi ") share one
+    // cache entry — typing the same query twice is then always instant.
+    const cacheKey = `search_${(query || '').trim().toLowerCase()}`;
     const cachedResults = await this.cacheService.get<any[]>(cacheKey);
     if (cachedResults) {
       this.logger.log(`Cache hit for search: ${query} (took ${Date.now() - startTime}ms)`);
@@ -221,6 +227,8 @@ export class YouTubeMusicService {
 
     this.logger.log(`Searching for: ${query}`);
 
+    const searchCtrl = new AbortController();
+    const searchTimer = setTimeout(() => searchCtrl.abort(), 12000);
     try {
       const response = await fetch(`${this.INNERTUBE_API_BASE}/search`, {
         method: 'POST',
@@ -229,6 +237,7 @@ export class YouTubeMusicService {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'X-Origin': 'https://music.youtube.com'
         },
+        signal: searchCtrl.signal,
         body: JSON.stringify({
           context: {
             client: {
@@ -251,10 +260,13 @@ export class YouTubeMusicService {
       const results = this.parseSearchSongs(data);
 
       await this.cacheService.set(cacheKey, results, 600);
+      clearTimeout(searchTimer);
 
-      // 🚀 BACKGROUND PRE-FETCHING: warm the exact resolvers play uses —
-      // Saavn 320 (needs title+artists, which results carry) AND YouTube —
-      // so tapping play is usually a cache hit on both paths.
+      // 🚀 BACKGROUND PRE-FETCHING: warm the exact resolvers play uses.
+      // Kept deliberately light: Saavn lookups are cheap API calls, but each
+      // YouTube resolve spawns a yt-dlp process — 4 of those per keystroke
+      // used to stampede the CPU (brutal on free-tier hosting), so only the
+      // top 2 get YouTube prefetching. Tapping play races Saavn first anyway.
       if (results.length > 0) {
         const top = results.slice(0, 4);
         this.logger.log(`🚀 Pre-fetching audio streams for top ${top.length} search results in background...`);
@@ -263,6 +275,8 @@ export class YouTubeMusicService {
           this.jioSaavnService
             .getBestStream(track.title, track.artists)
             .catch((err) => this.logger.warn('Background Saavn pre-fetch warning:', err?.message || err));
+        }
+        for (const track of results.slice(0, 2)) {
           this.getAudioStreamDetails(track.id)
             .catch((err) => this.logger.warn('Background YouTube pre-fetch warning:', err?.message || err));
         }
@@ -271,6 +285,7 @@ export class YouTubeMusicService {
       this.logger.log(`Search completed for "${query}" in ${Date.now() - startTime}ms`);
       return results;
     } catch (error) {
+      clearTimeout(searchTimer);
       this.logger.error('YouTube Music Search Error:', error);
       return [
         {

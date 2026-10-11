@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException, BadRequestException, ConflictException } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { Inject } from '@nestjs/common';
 import { getJwtSecret } from '../auth/jwt-secret.util';
@@ -15,10 +15,24 @@ function editKeyFor(shareId: string): string {
 export class PlaylistsService {
   constructor(@Inject('PrismaClient') private prisma: PrismaClient) {}
 
+  private async requireOwner(playlistId: string, userId: string) {
+    const pl = await this.prisma.playlist.findUnique({
+      where: { id: playlistId },
+      select: { ownerId: true },
+    });
+    if (!pl) throw new NotFoundException('Playlist not found');
+    if (pl.ownerId !== userId) throw new ForbiddenException('Not your playlist');
+  }
+
   async create(userId: string, data: { name: string, description?: string, coverImage?: string, isPublic?: boolean }) {
+    const name = typeof data?.name === 'string' ? data.name.trim().slice(0, 100) : '';
+    if (!name) throw new BadRequestException('Playlist name is required');
     return this.prisma.playlist.create({
       data: {
-        ...data,
+        name,
+        description: typeof data?.description === 'string' ? data.description.slice(0, 500) : undefined,
+        coverImage: typeof data?.coverImage === 'string' ? data.coverImage.slice(0, 500) : undefined,
+        isPublic: data?.isPublic !== false,
         ownerId: userId,
       },
     });
@@ -38,29 +52,52 @@ export class PlaylistsService {
     });
   }
 
-  async addTrack(playlistId: string, trackId: string, position: number) {
-    return this.prisma.playlistTrack.create({
-      data: { playlistId, trackId, position },
-    });
+  async addTrack(userId: string, playlistId: string, trackId: string, position: number) {
+    await this.requireOwner(playlistId, userId);
+    if (!trackId || typeof trackId !== 'string') {
+      throw new BadRequestException('trackId is required');
+    }
+    const pos = Number.isFinite(Number(position)) ? Math.max(0, Math.floor(Number(position))) : 0;
+    try {
+      return await this.prisma.playlistTrack.create({
+        data: { playlistId, trackId, position: pos },
+      });
+    } catch (err: any) {
+      if (err?.code === 'P2002') throw new ConflictException('Track already in playlist');
+      throw err;
+    }
   }
 
-  async removeTrack(playlistId: string, trackId: string) {
-    return this.prisma.playlistTrack.delete({
-      where: { playlistId_trackId: { playlistId, trackId } },
+  async removeTrack(userId: string, playlistId: string, trackId: string) {
+    await this.requireOwner(playlistId, userId);
+    const res = await this.prisma.playlistTrack.deleteMany({
+      where: { playlistId, trackId },
     });
+    return { removed: res.count > 0 };
   }
 
   async update(id: string, userId: string, data: any) {
+    await this.requireOwner(id, userId);
+    const patch: any = {};
+    if (typeof data?.name === 'string' && data.name.trim()) patch.name = data.name.trim().slice(0, 100);
+    if (typeof data?.description === 'string') patch.description = data.description.slice(0, 500);
+    if (typeof data?.coverImage === 'string') patch.coverImage = data.coverImage.slice(0, 500);
+    if (typeof data?.isPublic === 'boolean') patch.isPublic = data.isPublic;
+    if (Object.keys(patch).length === 0) {
+      return this.findOne(id, userId);
+    }
     return this.prisma.playlist.update({
       where: { id },
-      data,
+      data: patch,
     });
   }
 
   async delete(id: string, userId: string) {
-    return this.prisma.playlist.delete({
+    await this.requireOwner(id, userId);
+    await this.prisma.playlist.delete({
       where: { id },
     });
+    return { deleted: true };
   }
 
   private sanitizeShareTrack(s: any): any | null {
@@ -140,10 +177,14 @@ export class PlaylistsService {
       .map((t: any) => this.sanitizeShareTrack(t))
       .filter(Boolean)
       .slice(0, 200);
-    await this.prisma.sharedPlaylist.update({
-      where: { id },
-      data: { tracks: JSON.stringify(clean) },
-    });
+    try {
+      await this.prisma.sharedPlaylist.update({
+        where: { id },
+        data: { tracks: JSON.stringify(clean) },
+      });
+    } catch {
+      return { updated: false, reason: 'Share not found' };
+    }
     return { updated: true, trackCount: clean.length };
   }
 }

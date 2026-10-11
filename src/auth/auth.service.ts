@@ -1,4 +1,4 @@
-import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException, BadRequestException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaClient } from '@prisma/client';
 import * as bcrypt from 'bcrypt';
@@ -17,7 +17,12 @@ export class AuthService {
   }
 
   async register(dto: any) {
-    const { email, username, password } = dto;
+    const email = typeof dto?.email === 'string' ? dto.email.trim() : '';
+    const username = typeof dto?.username === 'string' ? dto.username.trim() : '';
+    const { password } = dto || {};
+    if (!email || !username) {
+      throw new BadRequestException('Email and username are required');
+    }
 
     const existingUser = await this.prisma.user.findFirst({
       where: { OR: [{ email }, { username }] },
@@ -59,6 +64,9 @@ export class AuthService {
     const { email, identifier, password } = dto;
     const loginId = identifier || email;
     if (!loginId || typeof loginId !== 'string') {
+      throw new UnauthorizedException('Invalid credentials');
+    }
+    if (typeof password !== 'string' || !password) {
       throw new UnauthorizedException('Invalid credentials');
     }
     const user = await this.prisma.user.findFirst({
@@ -111,56 +119,56 @@ export class AuthService {
   }
 
   private async rotateRefreshToken(refreshToken: string) {
-    // Check if token exists and is not revoked
-    const stored = await this.prisma.refreshToken.findUnique({
-      where: { hashedToken: this.hashToken(refreshToken) },
-    });
-    
-    if (!stored || stored.revoked) {
-      throw new UnauthorizedException('Invalid refresh token');
-    }
-    
-    if (stored.expiresAt < new Date()) {
-      throw new UnauthorizedException('Refresh token expired');
-    }
-    
     let payload: any;
     try {
       payload = await this.jwtService.verifyAsync(refreshToken);
     } catch {
       throw new UnauthorizedException('Invalid refresh token');
     }
-    
+
     // Refresh tokens carry only sub; access tokens carry email. Refuse to
     // "refresh" from an access token so the two can't be interchanged.
-    if (!payload?.sub || payload.email) {
+    if (!payload?.sub || typeof payload.sub !== 'string' || payload.email) {
       throw new UnauthorizedException('Invalid refresh token');
     }
-    
-    const user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+
+    let user: any = null;
+    try {
+      user = await this.prisma.user.findUnique({ where: { id: payload.sub } });
+    } catch {
+      // Malformed sub (e.g. non-UUID) fails Prisma validation — still a 401.
+      throw new UnauthorizedException('Invalid refresh token');
+    }
     if (!user) {
       throw new UnauthorizedException('Invalid refresh token');
     }
-    
-    // Create the replacement FIRST, then revoke the old one — both in one
-    // transaction, so a failure can never leave the user with no valid
-    // token (revoked old, missing new).
+
+    // Atomically consume the presented token: exactly one concurrent
+    // rotation can flip revoked:false -> true, so a replayed token finds
+    // zero rows and gets a 401 instead of a second fresh pair.
+    const consumed = await this.prisma.refreshToken.updateMany({
+      where: {
+        hashedToken: this.hashToken(refreshToken),
+        userId: user.id,
+        revoked: false,
+        expiresAt: { gt: new Date() },
+      },
+      data: { revoked: true },
+    });
+    if (consumed.count === 0) {
+      throw new UnauthorizedException('Invalid refresh token');
+    }
+
     const newRefreshToken = this.jwtService.sign({ sub: user.id, jti: randomUUID() }, { expiresIn: '7d' });
     const hashedNewToken = this.hashToken(newRefreshToken);
 
-    await this.prisma.$transaction([
-      this.prisma.refreshToken.create({
-        data: {
-          userId: user.id,
-          hashedToken: hashedNewToken,
-          expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
-        },
-      }),
-      this.prisma.refreshToken.update({
-        where: { id: stored.id },
-        data: { revoked: true },
-      }),
-    ]);
+    await this.prisma.refreshToken.create({
+      data: {
+        userId: user.id,
+        hashedToken: hashedNewToken,
+        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days
+      },
+    });
     
     const newPayload = { sub: user.id, email: user.email, role: user.role };
     return {

@@ -1,4 +1,5 @@
-import { Controller, Get, Post, Patch, Put, Delete, Body, Param, UseGuards, Req } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Put, Delete, Body, Param, UseGuards, Req, HttpException, HttpStatus } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { PlaylistsService } from './playlists.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
@@ -26,7 +27,7 @@ export class PlaylistsController {
   async getShare(@Param('id') id: string) {
     const share = await this.playlistsService.getShare(id);
     if (!share) {
-      return { error: 'Shared playlist not found' };
+      throw new HttpException({ error: 'Shared playlist not found' }, HttpStatus.NOT_FOUND);
     }
     return share;
   }
@@ -45,11 +46,14 @@ export class PlaylistsController {
 
   // Collaborative edit — public route, capability-checked via editKey.
   // Declared before ':id' so it can't be swallowed (different prefix anyway).
+  // Throttled: the 32-hex editKey must not be brute-forceable at line speed.
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
   @Put('share/:id/tracks')
   async updateSharedTracks(@Param('id') id: string, @Body() dto: any) {
     const result = await this.playlistsService.updateSharedTracks(id, dto?.editKey, dto?.tracks);
     if (!result.updated) {
-      return { error: result.reason || 'Update failed' };
+      const code = result.reason === 'invalid edit key' ? HttpStatus.FORBIDDEN : HttpStatus.NOT_FOUND;
+      throw new HttpException({ error: result.reason || 'Update failed' }, code);
     }
     return result;
   }
@@ -63,14 +67,14 @@ export class PlaylistsController {
 
   @UseGuards(JwtAuthGuard)
   @Post(':id/tracks')
-  async addTrack(@Param('id') id: string, @Body('trackId') trackId: string, @Body('position') position: number) {
-    return this.playlistsService.addTrack(id, trackId, position);
+  async addTrack(@Param('id') id: string, @Body('trackId') trackId: string, @Body('position') position: number, @Req() req: any) {
+    return this.playlistsService.addTrack(req.user?.userId || '', id, trackId, position);
   }
 
   @UseGuards(JwtAuthGuard)
   @Delete(':id/tracks/:trackId')
-  async removeTrack(@Param('id') id: string, @Param('trackId') trackId: string) {
-    return this.playlistsService.removeTrack(id, trackId);
+  async removeTrack(@Param('id') id: string, @Param('trackId') trackId: string, @Req() req: any) {
+    return this.playlistsService.removeTrack(req.user?.userId || '', id, trackId);
   }
 
   @UseGuards(JwtAuthGuard)

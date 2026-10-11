@@ -12,13 +12,27 @@ export class RecommendationService {
     private cache: CacheService,
   ) {}
 
+  private safeMoods(raw: unknown): string[] {
+    try {
+      if (Array.isArray(raw)) return raw.filter((m): m is string => typeof m === 'string');
+      if (typeof raw === 'string' && raw) {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.filter((m): m is string => typeof m === 'string') : [];
+      }
+    } catch {
+      // Corrupt row — treat as unmoodable rather than 500ing the feed.
+    }
+    return [];
+  }
+
   async recommendByMood(userId: string, moodId: string) {
-    const cacheKey = `mood:${moodId}:tracks`;
+    const safeMoodId = typeof moodId === 'string' && moodId.trim() ? moodId : 'chill';
+    const cacheKey = `mood:${safeMoodId.toLowerCase()}:tracks`;
     const cached = await this.cache.get(cacheKey);
     if (cached) return cached;
 
-    const params = this.moodEngine.getParamsForMood(moodId);
-    
+    const params = this.moodEngine.getParamsForMood(safeMoodId);
+
     const candidateTracks = await this.prisma.track.findMany({
       where: {
         energy: {
@@ -31,11 +45,12 @@ export class RecommendationService {
         },
       },
       include: { artists: { include: { artist: true } } },
+      orderBy: { createdAt: 'desc' },
       take: 50,
     });
 
     const tracks = candidateTracks.filter((t: any) => {
-      const moods = Array.isArray(t.mood) ? t.mood : (typeof t.mood === 'string' ? JSON.parse(t.mood || '[]') : []);
+      const moods = this.safeMoods(t.mood);
       return params.moods.some(m => moods.includes(m));
     }).slice(0, 20);
 
@@ -56,8 +71,9 @@ export class RecommendationService {
     });
 
     const rawMoods = user?.preferences?.preferredMoods;
-    const preferredMoodsArr = rawMoods ? (typeof rawMoods === 'string' ? JSON.parse(rawMoods) : rawMoods) : ['chill'];
-    const preferredMood = preferredMoodsArr[0] || 'chill';
+    const preferredMoodsArr = this.safeMoods(rawMoods);
+    const preferredMood =
+      preferredMoodsArr.length > 0 && preferredMoodsArr[0] ? preferredMoodsArr[0] : 'chill';
     const moodTracks = await this.recommendByMood(userId, preferredMood);
 
     const trendingTracks = await this.prisma.track.findMany({
@@ -94,6 +110,7 @@ export class RecommendationService {
   private async getHiddenGems() {
     return this.prisma.track.findMany({
       where: { energy: { gte: 0.6 } },
+      orderBy: { createdAt: 'desc' },
       take: 10,
       include: { artists: { include: { artist: true } } },
     });

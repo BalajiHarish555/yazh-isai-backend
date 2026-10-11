@@ -1,9 +1,22 @@
-import { Controller, Get, Post, Body, Param, Query, Res, Req } from '@nestjs/common';
+import { Controller, Get, Post, Body, Param, Query, Res, Req, UseGuards, BadRequestException } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { Response, Request } from 'express';
 import fetch from 'node-fetch';
+import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { TracksService } from './tracks.service';
 import { YouTubeMusicService } from '../youtube-music.service';
 import { JioSaavnService } from '../jiosaavn.service';
+
+// YouTube video ids are always 11 chars of [A-Za-z0-9_-]. Anything else is
+// either garbage or an attempt to make us spawn processes/fetch URLs for
+// attacker input (SSRF) and poison caches under attacker-chosen keys.
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+function assertVideoId(id: string) {
+  if (!VIDEO_ID_RE.test(id || '')) {
+    throw new BadRequestException('Invalid track id');
+  }
+}
 
 @Controller('tracks')
 export class TracksController {
@@ -13,13 +26,17 @@ export class TracksController {
     private readonly jioSaavnService: JioSaavnService,
   ) {}
 
+  @Throttle({ default: { limit: 30, ttl: 60000 } })
   @Get('search/youtube')
   async searchYouTube(@Query('q') q: string) {
-    return this.youtubeMusicService.searchTracks(q || '');
+    const query = typeof q === 'string' ? q.slice(0, 100) : '';
+    return this.youtubeMusicService.searchTracks(query);
   }
 
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
   @Get('proxy/:id')
   async proxyAudioStream(@Param('id') id: string, @Req() req: Request, @Res() res: Response): Promise<void> {
+    assertVideoId(id);
     const fail = (code: number, msg: string) => {
       if (!res.headersSent) {
         res.status(code).send(msg);
@@ -98,6 +115,7 @@ export class TracksController {
     }
   }
 
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
   @Get('stream/:id')
   async getStreamUrl(
     @Param('id') id: string,
@@ -106,6 +124,7 @@ export class TracksController {
     @Query('artist') artist?: string,
     @Query('quality') quality?: string,
   ) {
+    assertVideoId(id);
     const details = await this.youtubeMusicService.getAudioStreamDetails(id, title, artist, quality);
     // Build the fallback proxy URL from the request host — never hardcode
     // localhost, or LAN/cloud clients receive an unroutable URL.
@@ -131,13 +150,15 @@ export class TracksController {
     };
   }
 
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
   @Get('autoplay')
   async getAutoplay(
     @Query('title') title: string,
     @Query('artist') artist: string,
     @Query('limit') limit?: string,
   ) {
-    const n = Math.max(1, Math.min(15, parseInt(limit || '10', 10) || 10));
+    const parsed = Array.isArray(limit) ? NaN : parseInt(limit || '10', 10);
+    const n = Number.isFinite(parsed) ? Math.max(1, Math.min(15, Math.floor(parsed))) : 10;
     const norm = (s: string) =>
       (s || '').toLowerCase().replace(/[^a-z0-9\u0B80-\u0BFF ]/gi, '').replace(/\s+/g, ' ').trim();
     const out: any[] = [];
@@ -214,6 +235,7 @@ export class TracksController {
     return this.tracksService.findOne(id);
   }
 
+  @UseGuards(JwtAuthGuard)
   @Post()
   async create(@Body() dto: any) {
     return this.tracksService.create(dto);

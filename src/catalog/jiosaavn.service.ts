@@ -227,6 +227,15 @@ export class JioSaavnService {
       .trim();
   }
 
+  /** Short stable hash so truncated cache keys can't collide. */
+  private shortHash(s: string): string {
+    let h = 5381;
+    for (let i = 0; i < s.length; i++) {
+      h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    }
+    return (h >>> 0).toString(36);
+  }
+
   /** Persons (singers) listed in a bundled artist string. */
   private personNames(artist: string): string[] {
     const out: string[] = [];
@@ -293,7 +302,8 @@ export class JioSaavnService {
   async getAutoplaySeeds(title: string, artist: string, limit = 10): Promise<any[]> {
     const cleanTitle = this.normalizeTitle(title);
     if (!cleanTitle) return [];
-    const cacheKey = `saavn_autoplay_v2_${cleanTitle}_${this.normName(artist).slice(0, 60)}`;
+    const normArtist = this.normName(artist);
+    const cacheKey = `saavn_autoplay_v3_${cleanTitle}_${normArtist.slice(0, 48)}_${this.shortHash(normArtist)}`;
     const cached = await this.cacheService.get<any[]>(cacheKey);
     if (cached && cached.length > 0) {
       this.logger.log(`Saavn autoplay cache hit: ${title} - ${artist}`);

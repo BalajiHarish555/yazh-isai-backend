@@ -161,7 +161,10 @@ export class LyricsService {
     }
 
     const startTime = Date.now();
-    const cacheKey = `lyrics_${artist.toLowerCase().trim()}_${track.toLowerCase().trim()}`;
+    // Length-prefixed segments: `a_b`+`c` and `a`+`b_c` must not share a key.
+    const a = artist.toLowerCase().trim();
+    const t = track.toLowerCase().trim();
+    const cacheKey = `lyrics_${a.length}:${a}_${t.length}:${t}`;
 
     // Try to get from cache first (tolerates pre-upgrade plain-string entries)
     const cached = await this.cacheService.get<any>(cacheKey);

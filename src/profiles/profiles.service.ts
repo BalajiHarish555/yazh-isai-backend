@@ -53,6 +53,9 @@ export class ProfilesService {
         data[field] = dto[field].slice(0, 500);
       }
     }
+    if (Object.keys(data).length === 0) {
+      return this.prisma.profile.findUnique({ where: { userId } });
+    }
     return this.prisma.profile.upsert({
       where: { userId },
       update: data,

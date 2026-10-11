@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { Inject } from '@nestjs/common';
 
@@ -7,6 +7,13 @@ export class LibraryService {
   constructor(@Inject('PrismaClient') private prisma: PrismaClient) {}
 
   async likeTrack(userId: string, trackId: string) {
+    // External/YouTube ids have no catalog row — reject with 404 instead of
+    // letting the FK throw a raw 500.
+    const track = await this.prisma.track.findUnique({
+      where: { id: trackId },
+      select: { id: true },
+    });
+    if (!track) throw new NotFoundException('Track not found in catalog');
     return this.prisma.likedTrack.upsert({
       where: { userId_trackId: { userId, trackId } },
       update: {},
@@ -15,9 +22,10 @@ export class LibraryService {
   }
 
   async unlikeTrack(userId: string, trackId: string) {
-    return this.prisma.likedTrack.delete({
-      where: { userId_trackId: { userId, trackId } },
+    const res = await this.prisma.likedTrack.deleteMany({
+      where: { userId, trackId },
     });
+    return { removed: res.count > 0 };
   }
 
   async getLikedTracks(userId: string) {
@@ -25,10 +33,15 @@ export class LibraryService {
       where: { userId },
       include: { track: { include: { artists: { include: { artist: true } } } } },
     });
-    return liked.map((lt: any) => lt.track);
+    return liked.map((lt: any) => lt.track).filter(Boolean);
   }
 
   async followArtist(userId: string, artistId: string) {
+    const artist = await this.prisma.artist.findUnique({
+      where: { id: artistId },
+      select: { id: true },
+    });
+    if (!artist) throw new NotFoundException('Artist not found');
     return this.prisma.followedArtist.upsert({
       where: { userId_artistId: { userId, artistId } },
       update: {},
@@ -37,9 +50,10 @@ export class LibraryService {
   }
 
   async unfollowArtist(userId: string, artistId: string) {
-    return this.prisma.followedArtist.delete({
-      where: { userId_artistId: { userId, artistId } },
+    const res = await this.prisma.followedArtist.deleteMany({
+      where: { userId, artistId },
     });
+    return { removed: res.count > 0 };
   }
 
   async getFollowedArtists(userId: string) {
@@ -47,6 +61,6 @@ export class LibraryService {
       where: { userId },
       include: { artist: true },
     });
-    return followed.map((fa: any) => fa.artist);
+    return followed.map((fa: any) => fa.artist).filter(Boolean);
   }
 }
