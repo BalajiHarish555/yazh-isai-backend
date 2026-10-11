@@ -13,7 +13,34 @@ export class YouTubeMusicService {
   constructor(
     private cacheService: CacheService,
     private jioSaavnService: JioSaavnService,
-  ) {}
+  ) {
+    // Cloud hosts (especially free tiers) page the ~30MB yt-dlp binary in
+    // excruciatingly slowly on first spawn — the health probe watched it
+    // take >10s. Warm it once shortly after boot so the first real song
+    // doesn't pay that cold-start tax. Fire-and-forget by design.
+    const warmTimer = setTimeout(() => {
+      this.warmUp().catch(() => undefined);
+    }, 5000);
+    const wt: any = warmTimer;
+    if (wt && typeof wt.unref === 'function') wt.unref();
+  }
+
+  private async warmUp(): Promise<void> {
+    try {
+      await youtubedl('https://www.youtube.com/watch?v=aqz-KE-bpKQ', {
+        getUrl: true,
+        format: 'bestaudio/bestaudio*',
+        noCheckCertificates: true,
+        noWarnings: true,
+        noPlaylist: true,
+        socketTimeout: 25,
+        retries: 1,
+      });
+      this.logger.log('yt-dlp warmed up');
+    } catch (error: any) {
+      this.logger.warn(`yt-dlp warm-up failed (will retry on demand): ${error?.message || error}`);
+    }
+  }
 
   async getAudioStreamDetails(videoId: string, title?: string, artist?: string, quality?: string): Promise<{
     streamUrl: string;
