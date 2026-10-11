@@ -5,3 +5,5 @@ dist/
 *.err
 *.db
 .DS_Store
+# Runtime artifacts dropped by the YouTube resolver (player signature dumps)
+*-player-script.js
