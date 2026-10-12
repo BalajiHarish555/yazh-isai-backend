@@ -37,7 +37,6 @@ export class YouTubeMusicService implements OnModuleInit {
       const t: any = timer;
       if (t && typeof t.unref === 'function') t.unref();
     });
-  }
     // Cloud hosts (especially free tiers) page the ~30MB yt-dlp binary in
     // excruciatingly slowly on first spawn — the health probe watched it
     // take >10s. Warm it once shortly after boot so the first real song
