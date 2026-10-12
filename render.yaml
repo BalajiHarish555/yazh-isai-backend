@@ -24,3 +24,14 @@ services:
       # from a local origin, so it is allowlisted explicitly here.
       - key: CORS_ORIGIN
         value: "https://localhost,http://localhost,capacitor://localhost"
+
+  # Free web services sleep after ~15 min idle, and the first visit then
+  # pays a 30-60s cold start. This cron pings /health every 10 minutes to
+  # keep the instance (and its caches) warm. It does NOT fix YouTube
+  # throttling — only a paid instance with full CPU does that.
+  # NOTE: the URL below must match this service's public address.
+  - type: cron
+    name: yazh-keep-warm
+    plan: free
+    schedule: "*/10 * * * *"
+    command: "curl -fsS https://yazh-isai.onrender.com/api/v1/health > /dev/null"
