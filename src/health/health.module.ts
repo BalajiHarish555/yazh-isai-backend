@@ -25,6 +25,12 @@ export class HealthController {
     return {
       status: database === 'healthy' ? 'ok' : 'degraded',
       timestamp: new Date().toISOString(),
+      // Deploy marker the app uses to notice a new version without
+      // reloading itself mid-song. Render injects RENDER_GIT_COMMIT.
+      version:
+        (process.env.RENDER_GIT_COMMIT || '').slice(0, 7) ||
+        process.env.APP_VERSION ||
+        'dev',
       services: {
         database,
         redis,
