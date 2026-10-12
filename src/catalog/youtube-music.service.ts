@@ -78,6 +78,9 @@ export class YouTubeMusicService {
           noPlaylist: true,
           socketTimeout: 10,
           retries: 2,
+          // Datacenter IPs get throttled/blocked on the web player client;
+          // the Android client is far less restricted there.
+          extractorArgs: 'youtube:player_client=android',
         });
         const resultUrl = typeof url === 'string' ? url.trim() : null;
         if (resultUrl) {
