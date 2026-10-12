@@ -293,10 +293,11 @@ export class YouTubeMusicService {
       clearTimeout(searchTimer);
 
       // 🚀 BACKGROUND PRE-FETCHING: warm the exact resolvers play uses.
-      // Kept deliberately light: Saavn lookups are cheap API calls, but each
-      // YouTube resolve spawns a yt-dlp process — 4 of those per keystroke
-      // used to stampede the CPU (brutal on free-tier hosting), so only the
-      // top 2 get YouTube prefetching. Tapping play races Saavn first anyway.
+      // Saavn lookups are cheap API calls and always run. YouTube resolves
+      // spawn yt-dlp processes — fine on a dev machine, but on free-tier
+      // hosting two of those per keystroke stampede the shared CPU and slow
+      // the very response being built, so production skips them entirely.
+      // Tapping play races Saavn first anyway.
       if (results.length > 0) {
         const top = results.slice(0, 4);
         this.logger.log(`🚀 Pre-fetching audio streams for top ${top.length} search results in background...`);
@@ -306,9 +307,11 @@ export class YouTubeMusicService {
             .getBestStream(track.title, track.artists)
             .catch((err) => this.logger.warn('Background Saavn pre-fetch warning:', err?.message || err));
         }
-        for (const track of results.slice(0, 2)) {
-          this.getAudioStreamDetails(track.id)
-            .catch((err) => this.logger.warn('Background YouTube pre-fetch warning:', err?.message || err));
+        if (process.env.NODE_ENV !== 'production') {
+          for (const track of results.slice(0, 2)) {
+            this.getAudioStreamDetails(track.id)
+              .catch((err) => this.logger.warn('Background YouTube pre-fetch warning:', err?.message || err));
+          }
         }
       }
 
