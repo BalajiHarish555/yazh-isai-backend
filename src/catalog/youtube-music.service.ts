@@ -1,12 +1,23 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import youtubedl from 'youtube-dl-exec';
 import ytdl from '@distube/ytdl-core';
 import fetch from 'node-fetch';
 import { CacheService } from '../common/cache.service';
 import { JioSaavnService } from './jiosaavn.service';
 
+// Queries users type first, warmed shortly after boot so opening searches
+// feel instant instead of paying a cold upstream round-trip.
+const WARM_QUERIES = [
+  'tamil hits',
+  'anirudh ravichander tamil song',
+  'a r rahman tamil song',
+  'yuvan shankar raja tamil song',
+  'ilaiyaraaja tamil song',
+  'tamil melody songs',
+];
+
 @Injectable()
-export class YouTubeMusicService {
+export class YouTubeMusicService implements OnModuleInit {
   private readonly INNERTUBE_API_BASE = 'https://music.youtube.com/youtubei/v1';
   private readonly logger = new Logger(YouTubeMusicService.name);
 
@@ -14,6 +25,19 @@ export class YouTubeMusicService {
     private cacheService: CacheService,
     private jioSaavnService: JioSaavnService,
   ) {
+    // Pre-warm runs from onModuleInit below.
+  }
+
+  onModuleInit() {
+    // Staggered fire-and-forget: never blocks boot, never fails boot.
+    WARM_QUERIES.forEach((q, i) => {
+      const timer = setTimeout(() => {
+        this.searchTracks(q).catch(() => undefined);
+      }, 8000 + i * 4000);
+      const t: any = timer;
+      if (t && typeof t.unref === 'function') t.unref();
+    });
+  }
     // Cloud hosts (especially free tiers) page the ~30MB yt-dlp binary in
     // excruciatingly slowly on first spawn — the health probe watched it
     // take >10s. Warm it once shortly after boot so the first real song
