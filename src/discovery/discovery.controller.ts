@@ -1,6 +1,7 @@
 import { Controller, Get, Query, Param, UseGuards, Req } from '@nestjs/common';
 import { RecommendationService } from './recommendation.service';
 import { MoodEngineService } from './mood-engine.service';
+import { TasteProfileService } from './taste-profile.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 
 @Controller('discovery')
@@ -8,6 +9,7 @@ export class DiscoveryController {
   constructor(
     private readonly recService: RecommendationService,
     private readonly moodEngine: MoodEngineService,
+    private readonly tasteService: TasteProfileService,
   ) {}
 
   @UseGuards(JwtAuthGuard)
@@ -27,5 +29,12 @@ export class DiscoveryController {
   @Get('moods')
   async getAvailableMoods() {
     return this.moodEngine.getAllMoods();
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('taste')
+  async getTaste(@Req() req: any, @Query('limit') limit?: string) {
+    const userId = req.user?.userId || '';
+    return this.tasteService.getTasteForUser(userId, limit ? parseInt(limit, 10) : 20);
   }
 }
