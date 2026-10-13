@@ -4,6 +4,7 @@ import ytdl from '@distube/ytdl-core';
 import fetch from 'node-fetch';
 import { CacheService } from '../common/cache.service';
 import { JioSaavnService } from './jiosaavn.service';
+import { DeezerService } from './deezer.service';
 
 // Queries users type first, warmed shortly after boot so opening searches
 // feel instant instead of paying a cold upstream round-trip.
@@ -24,6 +25,7 @@ export class YouTubeMusicService implements OnModuleInit {
   constructor(
     private cacheService: CacheService,
     private jioSaavnService: JioSaavnService,
+    private deezerService: DeezerService,
   ) {
     // Pre-warm runs from onModuleInit below.
   }
@@ -74,6 +76,7 @@ export class YouTubeMusicService implements OnModuleInit {
     quality: 'high' | 'medium' | 'low';
     isLossless: boolean;
     source: string;
+    resolvedQuality: 'best' | 'saver';
   } | null> {
     const startTime = Date.now();
     const saver = (quality || '').toLowerCase() === 'saver';
@@ -124,6 +127,7 @@ export class YouTubeMusicService implements OnModuleInit {
             quality: (isWebm ? 'high' : 'medium') as 'high' | 'medium' | 'low',
             isLossless: false,
             source: 'YouTube Music',
+            resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
           };
         }
         return null;
@@ -152,7 +156,7 @@ export class YouTubeMusicService implements OnModuleInit {
           });
 
         if (audioOnlyFormats.length > 0 && audioOnlyFormats[0].url) {
-          return this.describeAudioFormat(audioOnlyFormats[0]);
+          return this.describeAudioFormat(audioOnlyFormats[0], saver);
         }
         return null;
       };
@@ -167,7 +171,37 @@ export class YouTubeMusicService implements OnModuleInit {
         });
       };
 
-      // Saavn is the quality ceiling (up to 320kbps verified AAC) and
+      // Deezer FLAC is the true quality ceiling (1411kbps lossless, better
+      // than Saavn's 320 ceiling). It is tried FIRST — but only when the user
+      // asked for 'best', and only when DEEZER_ARL is configured. It is a
+      // plain HTTP round-trip (~1-2s), so it doesn't stall the chain. When it
+      // fails (no ARL, geoblocked, no match) we fall straight through to
+      // Saavn below, so nothing regresses.
+      if (title && !saver && this.deezerService.isEnabled()) {
+        const flac = await this.deezerService
+          .getBestFlacStream(title, artist || '')
+          .catch(() => null);
+        if (flac?.streamUrl) {
+          const details = {
+            streamUrl: flac.streamUrl,
+            bitrate: flac.bitrate,
+            codec: flac.codec,
+            mimeType: flac.mimeType,
+            qualityLabel: flac.qualityLabel,
+            quality: flac.quality,
+            isLossless: true,
+            source: flac.source,
+            resolvedQuality: 'best' as const,
+          };
+          await this.cacheService.set(cacheKey, details, 21600);
+          this.logger.log(
+            `Deezer FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
+          );
+          return details;
+        }
+      }
+
+      // Saavn is the lossy quality ceiling (up to 320kbps verified AAC) and
       // resolves in ~1-3s (plain API call, no process spawn). It is tried
       // FIRST and wins on success — yt-dlp (~9s cold spawn) is the true
       // fallback, ytdl-core the last resort. This makes the 320 lane
@@ -187,6 +221,7 @@ export class YouTubeMusicService implements OnModuleInit {
             quality: saavn.quality,
             isLossless: false,
             source: saavn.source,
+            resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
           };
           await this.cacheService.set(cacheKey, details, 1800);
           this.logger.log(
@@ -244,7 +279,7 @@ export class YouTubeMusicService implements OnModuleInit {
     }
   }
 
-  private describeAudioFormat(best: any) {
+  private describeAudioFormat(best: any, saver = false) {
     const bitrate = best.audioBitrate || 128;
     const mimeType: string = best.mimeType || 'audio/webm; codecs="opus"';
     const isOpus = mimeType.includes('opus');
@@ -261,6 +296,7 @@ export class YouTubeMusicService implements OnModuleInit {
       // YouTube Music streams are lossy. Never label these lossless/FLAC.
       isLossless: false,
       source: 'YouTube Music',
+      resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
     };
   }
 

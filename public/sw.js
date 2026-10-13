@@ -37,6 +37,48 @@ async function trimImages() {
   }
 }
 
+// Serve a full cached Response with proper Range slicing. A plain
+// cache.match answers 200-full to Range requests, which breaks the audio
+// element's seeking and stalls playback.
+function sliceCachedResponse(stored, rangeHeader) {
+  return stored.arrayBuffer().then((buf) => {
+    const total = buf.byteLength;
+    const type = stored.headers.get('content-type') || 'audio/webm';
+    if (!rangeHeader) {
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          'Content-Type': type,
+          'Content-Length': String(total),
+          'Accept-Ranges': 'bytes',
+        },
+      });
+    }
+    const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+    let start = 0;
+    let end = total - 1;
+    if (m) {
+      if (m[1]) start = parseInt(m[1], 10);
+      if (m[2]) end = Math.min(parseInt(m[2], 10), total - 1);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start >= total || end < start) {
+      return new Response(null, {
+        status: 416,
+        headers: { 'Content-Range': `bytes */${total}` },
+      });
+    }
+    return new Response(buf.slice(start, end + 1), {
+      status: 206,
+      headers: {
+        'Content-Type': type,
+        'Content-Length': String(end - start + 1),
+        'Content-Range': `bytes ${start}-${end}/${total}`,
+        'Accept-Ranges': 'bytes',
+      },
+    });
+  });
+}
+
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   if (request.method !== 'GET') return;
@@ -60,42 +102,7 @@ self.addEventListener('fetch', (event) => {
             return new Response(null, { status: 503 });
           }
         }
-        const buf = await stored.arrayBuffer();
-        const total = buf.byteLength;
-        const type = stored.headers.get('content-type') || 'audio/webm';
-        const range = request.headers.get('range');
-        if (!range) {
-          return new Response(buf, {
-            status: 200,
-            headers: {
-              'Content-Type': type,
-              'Content-Length': String(total),
-              'Accept-Ranges': 'bytes',
-            },
-          });
-        }
-        const m = /^bytes=(\d*)-(\d*)$/.exec(range.trim());
-        let start = 0;
-        let end = total - 1;
-        if (m) {
-          if (m[1]) start = parseInt(m[1], 10);
-          if (m[2]) end = Math.min(parseInt(m[2], 10), total - 1);
-        }
-        if (!Number.isFinite(start) || !Number.isFinite(end) || start >= total || end < start) {
-          return new Response(null, {
-            status: 416,
-            headers: { 'Content-Range': `bytes */${total}` },
-          });
-        }
-        return new Response(buf.slice(start, end + 1), {
-          status: 206,
-          headers: {
-            'Content-Type': type,
-            'Content-Length': String(end - start + 1),
-            'Content-Range': `bytes ${start}-${end}/${total}`,
-            'Accept-Ranges': 'bytes',
-          },
-        });
+        return sliceCachedResponse(stored, request.headers.get('range'));
       }),
     );
     return;
@@ -107,14 +114,15 @@ self.addEventListener('fetch', (event) => {
     url.hostname.includes('saavncdn.com');
 
   // Saved Saavn tracks: immutable CDN files -> cache-first (this is what
-  // makes offline playback work). Everything else audio (expiring
-  // googlevideo URLs) stays network-only so stale links can never stick.
+  // makes offline playback work). Range requests are sliced so seeking
+  // works on cached tracks. Everything else audio (expiring googlevideo
+  // URLs) stays network-only so stale links can never stick.
   if (isAudio) {
     if (!url.hostname.includes('saavncdn.com')) return;
     event.respondWith(
       caches.open(AUDIO_CACHE).then(async (cache) => {
         const cached = await cache.match(request);
-        if (cached) return cached;
+        if (cached) return sliceCachedResponse(cached, request.headers.get('range'));
         const res = await fetch(request);
         if (res && res.ok) cache.put(request, res.clone());
         return res;

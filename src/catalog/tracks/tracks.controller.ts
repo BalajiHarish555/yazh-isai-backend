@@ -176,8 +176,18 @@ export class TracksController {
     }
     // Primary: direct upstream URL (no server hop). Fallback: same-origin
     // proxy (CORS-safe for the Web Audio EQ graph).
+    //
+    // The Deezer FLAC lane returns a RELATIVE path (/api/v1/deezer/stream/...)
+    // because it must go through our decrypting proxy — the raw CDN url is
+    // Blowfish-encrypted AND expiring. Absolutize it against the request host
+    // so both the web origin and the APK WebView (different origin) can play it.
+    let streamUrl = details.streamUrl;
+    if (typeof streamUrl === 'string' && streamUrl.startsWith('/')) {
+      streamUrl = `${proto}://${host}${streamUrl}`;
+    }
     return {
       ...details,
+      streamUrl,
       proxyUrl,
     };
   }
