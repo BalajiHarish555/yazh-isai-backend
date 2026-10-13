@@ -145,23 +145,39 @@ export class JioSaavnService {
   }
 
   /**
-   * Resolve the best JioSaavn stream for a song. Only returns a result when
-   * a high-confidence match offers verified 320kbps — a wrong song at high
-   * bitrate is worse than the right song at 160kbps, so callers fall back
-   * to YouTube on null.
+   * Resolve the best JioSaavn stream for a song. Tries 320kbps first (the
+   * quality ceiling most songs hit), then falls back to 160kbps — a wrong
+   * song at high bitrate is worse than the right song at 160kbps, so
+   * callers fall back to YouTube only when both tiers fail to match.
+   *
+   * quality === 'saver' skips the 320 tier on purpose: ~160kbps uses half
+   * the bandwidth and is indistinguishable on mobile speakers.
    */
-  async getBestStream(title: string, artist: string): Promise<SaavnStreamDetails | null> {
+  async getBestStream(
+    title: string,
+    artist: string,
+    quality: 'best' | 'saver' = 'best',
+  ): Promise<SaavnStreamDetails | null> {
     const cleanTitle = this.normalizeTitle(title);
     if (!cleanTitle) return null;
     const artistTokens = this.artistTokens(artist);
     const primary = this.primaryArtist(artist);
 
-    const cacheKey = `saavn_stream_${cleanTitle}_${artistTokens.slice(0, 2).join('_')}`;
+    const cacheKey = `saavn_stream_${quality}_${cleanTitle}_${artistTokens.slice(0, 2).join('_')}`;
     const cached = await this.cacheService.get<SaavnStreamDetails>(cacheKey);
     if (cached) {
-      this.logger.log(`Saavn cache hit: ${title} - ${artist}`);
+      this.logger.log(`Saavn cache hit (${quality}): ${title} - ${artist}`);
       return cached;
     }
+
+    // Suffixes in descending quality order; 'saver' starts at 160.
+    const tiers =
+      quality === 'saver'
+        ? [{ suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const }]
+        : [
+            { suffix: '_320.mp4', bitrate: 320, label: '320kbps AAC (High)', q: 'high' as const },
+            { suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const },
+          ];
 
     const queries = primary ? [`${cleanTitle} ${primary}`, cleanTitle] : [cleanTitle];
     for (const q of queries.slice(0, 2)) {
@@ -177,36 +193,42 @@ export class JioSaavnService {
         // Title must strongly match AND at least one artist token must hit.
         if (score < 4) continue;
         const more = item?.more_info || {};
-        if (more['320kbps'] !== 'true') continue;
         const encrypted: string = more.encrypted_media_url || '';
         if (!encrypted) continue;
         const raw = this.decryptMediaUrl(encrypted);
         if (!raw) continue;
-        const url320 = raw.replace('_96.mp4', '_320.mp4');
-        if (url320 === raw) continue;
-        if (!(await this.verifyStream(url320))) {
-          this.logger.log(`Saavn 320 URL failed verification for: ${item?.title}`);
-          continue;
+
+        for (const tier of tiers) {
+          // Only 320 is gated on the 320kbps flag; 160 is always constructible.
+          if (tier.suffix === '_320.mp4' && more['320kbps'] !== 'true') continue;
+          const url: string = raw.replace('_96.mp4', tier.suffix);
+          if (url === raw || !url.includes(tier.suffix)) continue;
+          if (!(await this.verifyStream(url))) {
+            this.logger.log(`Saavn ${tier.bitrate} URL failed verification for: ${item?.title}`);
+            continue;
+          }
+          const details: SaavnStreamDetails = {
+            streamUrl: url,
+            bitrate: tier.bitrate,
+            codec: 'AAC',
+            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+            qualityLabel: tier.label,
+            quality: tier.q,
+            isLossless: false,
+            source: 'JioSaavn',
+            title: item?.title || title,
+            artists: item?.subtitle || artist,
+          };
+          await this.cacheService.set(cacheKey, details, 21600);
+          this.logger.log(
+            `Saavn ${tier.bitrate}kbps match (score ${score}): ${item?.title}`,
+          );
+          return details;
         }
-        const details: SaavnStreamDetails = {
-          streamUrl: url320,
-          bitrate: 320,
-          codec: 'AAC',
-          mimeType: 'audio/mp4; codecs="mp4a.40.2"',
-          qualityLabel: '320kbps AAC (High)',
-          quality: 'high',
-          isLossless: false,
-          source: 'JioSaavn',
-          title: item?.title || title,
-          artists: item?.subtitle || artist,
-        };
-        await this.cacheService.set(cacheKey, details, 21600);
-        this.logger.log(`Saavn 320kbps match (score ${score}): ${item?.title}`);
-        return details;
       }
     }
 
-    this.logger.log(`No high-confidence Saavn 320 match for: ${title} - ${artist}`);
+    this.logger.log(`No high-confidence Saavn match for: ${title} - ${artist}`);
     return null;
   }
 

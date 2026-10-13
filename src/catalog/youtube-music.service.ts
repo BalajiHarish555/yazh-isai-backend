@@ -76,9 +76,12 @@ export class YouTubeMusicService implements OnModuleInit {
     source: string;
   } | null> {
     const startTime = Date.now();
+    const saver = (quality || '').toLowerCase() === 'saver';
     // NOTE: googlevideo URLs expire (typically within hours), so cache for
-    // 30 min max — a stale cached URL plays nothing.
-    const cacheKey = `audio_details_${videoId}`;
+    // 30 min max — a stale cached URL plays nothing. Quality is part of the
+    // key so a 'saver' hit can never satisfy a 'best' request (and vice
+    // versa) for 30 minutes.
+    const cacheKey = `audio_details_${videoId}_${saver ? 'saver' : 'best'}`;
     const cachedDetails = await this.cacheService.get<any>(cacheKey);
     if (cachedDetails) {
       this.logger.log(`Cache hit for audio details: ${videoId} (${Date.now() - startTime}ms)`);
@@ -95,7 +98,9 @@ export class YouTubeMusicService implements OnModuleInit {
       const resolveViaYtDlp = async () => {
         const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
           getUrl: true,
-          format: 'bestaudio/bestaudio*',
+          // Prefer Opus (better quality-per-bit than AAC at the same
+          // bitrate); fall back to any audio-only format.
+          format: 'bestaudio[acodec*=opus]/bestaudio/bestaudio*',
           noCheckCertificates: true,
           noWarnings: true,
           noPlaylist: true,
@@ -162,40 +167,39 @@ export class YouTubeMusicService implements OnModuleInit {
         });
       };
 
-      // Race all resolvers: first SUCCESS wins. JioSaavn 320kbps direct CDN
-      // URLs resolve in ~1-3s (plain API call, no process spawn) and usually
-      // beat yt-dlp's ~9s cold start for Tamil/film songs; yt-dlp stays the
-      // reliable fallback, ytdl-core the quick third lane. Every promise is
-      // observed from birth (never an unhandled rejection), losers ignored.
-      const racers: Array<Promise<any>> = [];
-      // Saver mode skips the 320kbps lane on purpose: ~160kbps Opus uses
-      // roughly half the bandwidth. 'best' (default) races everything.
-      const saver = (quality || '').toLowerCase() === 'saver';
-      if (title && !saver) {
-        const saavnAttempt = (async () => {
-          try {
-            const s = await withTimeout(
-              this.jioSaavnService.getBestStream(title, artist || ''),
-              12000,
-            );
-            if (!s?.streamUrl) return null;
-            return {
-              streamUrl: s.streamUrl,
-              bitrate: s.bitrate,
-              codec: s.codec,
-              mimeType: s.mimeType,
-              qualityLabel: s.qualityLabel,
-              quality: s.quality,
-              isLossless: false,
-              source: s.source,
-            };
-          } catch {
-            return null;
-          }
-        })();
-        racers.push(saavnAttempt);
+      // Saavn is the quality ceiling (up to 320kbps verified AAC) and
+      // resolves in ~1-3s (plain API call, no process spawn). It is tried
+      // FIRST and wins on success — yt-dlp (~9s cold spawn) is the true
+      // fallback, ytdl-core the last resort. This makes the 320 lane
+      // authoritative instead of racing, so 'best' actually gets 320 whenever
+      // Saavn has a confident match.
+      if (title) {
+        const saavn = await this.jioSaavnService
+          .getBestStream(title, artist || '', saver ? 'saver' : 'best')
+          .catch(() => null);
+        if (saavn?.streamUrl) {
+          const details = {
+            streamUrl: saavn.streamUrl,
+            bitrate: saavn.bitrate,
+            codec: saavn.codec,
+            mimeType: saavn.mimeType,
+            qualityLabel: saavn.qualityLabel,
+            quality: saavn.quality,
+            isLossless: false,
+            source: saavn.source,
+          };
+          await this.cacheService.set(cacheKey, details, 1800);
+          this.logger.log(
+            `Saavn ${saavn.bitrate}kbps authoritative for ${videoId} in ${Date.now() - startTime}ms`,
+          );
+          return details;
+        }
       }
-      racers.push(
+
+      // YouTube fallback: race yt-dlp and ytdl-core, first success wins.
+      // Every promise is observed from birth (never an unhandled
+      // rejection), losers ignored.
+      const racers: Array<Promise<any>> = [
         withTimeout(resolveViaYtDlp(), 20000).catch((error: any) => {
           this.logger.warn(`youtube-dl-exec failed for ${videoId} (${error?.message || error})`);
           return null;
@@ -204,10 +208,7 @@ export class YouTubeMusicService implements OnModuleInit {
           this.logger.warn(`ytdl-core fallback failed for ${videoId} (${error?.message || error})`);
           return null;
         }),
-      );
-      const tags = title && !saver
-        ? ['saavn-320', 'yt-dlp', 'ytdl-core']
-        : ['yt-dlp', 'ytdl-core'];
+      ];
       let details: any = null;
       let pending = racers.length;
       let done = false;
@@ -226,6 +227,7 @@ export class YouTubeMusicService implements OnModuleInit {
             resolve(null);
           }
         };
+        const tags = ['yt-dlp', 'ytdl-core'];
         racers.forEach((p, i) => p.then((d) => onWin(d, tags[i] || `racer-${i}`)));
       });
 
@@ -262,8 +264,13 @@ export class YouTubeMusicService implements OnModuleInit {
     };
   }
 
-  async getAudioStreamUrl(videoId: string): Promise<string | null> {
-    const details = await this.getAudioStreamDetails(videoId);
+  async getAudioStreamUrl(
+    videoId: string,
+    title?: string,
+    artist?: string,
+    quality?: string,
+  ): Promise<string | null> {
+    const details = await this.getAudioStreamDetails(videoId, title, artist, quality);
     return details?.streamUrl || null;
   }
 

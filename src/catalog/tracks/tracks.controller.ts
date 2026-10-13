@@ -35,7 +35,14 @@ export class TracksController {
 
   @Throttle({ default: { limit: 60, ttl: 60000 } })
   @Get('proxy/:id')
-  async proxyAudioStream(@Param('id') id: string, @Req() req: Request, @Res() res: Response): Promise<void> {
+  async proxyAudioStream(
+    @Param('id') id: string,
+    @Req() req: Request,
+    @Res() res: Response,
+    @Query('title') title?: string,
+    @Query('artist') artist?: string,
+    @Query('quality') quality?: string,
+  ): Promise<void> {
     assertVideoId(id);
     const fail = (code: number, msg: string) => {
       if (!res.headersSent) {
@@ -50,7 +57,9 @@ export class TracksController {
     };
     let streamUrl: string | null = null;
     try {
-      streamUrl = await this.youtubeMusicService.getAudioStreamUrl(id);
+      // Pass title/artist/quality through so the proxy can also hit the
+      // Saavn 320/160 lane instead of always falling back to YouTube.
+      streamUrl = await this.youtubeMusicService.getAudioStreamUrl(id, title, artist, quality);
     } catch (err) {
       console.error('Audio proxy resolve error:', err);
     }
@@ -60,18 +69,28 @@ export class TracksController {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    // Connect/headers timeout only — cleared the moment upstream responds.
+    // A whole-lifetime timer here would kill any stream longer than N seconds
+    // (the old 15 s budget truncated every song it proxied).
+    const timer = setTimeout(() => controller.abort(), 12000);
     try {
       const range = req.headers.range;
+      // Referer must match the upstream host: YouTube needs its own, while
+      // Saavn's CDN rejects a youtube.com referer.
+      const referer = streamUrl.includes('jiosaavn') || streamUrl.includes('saavncdn')
+        ? 'https://www.jiosaavn.com/'
+        : 'https://www.youtube.com/';
       const upstream = await fetch(streamUrl, {
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          Referer: 'https://www.youtube.com/',
+          Referer: referer,
           ...(range ? { Range: range } : {}),
         },
         signal: controller.signal,
       });
+      // Headers received — the body can stream for minutes; stop the clock.
+      clearTimeout(timer);
       if (!upstream.ok && upstream.status !== 206) {
         console.error(`Audio proxy upstream ${upstream.status} for ${id}`);
         fail(502, 'Upstream audio unavailable');
@@ -127,19 +146,32 @@ export class TracksController {
     assertVideoId(id);
     const details = await this.youtubeMusicService.getAudioStreamDetails(id, title, artist, quality);
     // Build the fallback proxy URL from the request host — never hardcode
-    // localhost, or LAN/cloud clients receive an unroutable URL.
+    // localhost, or LAN/cloud clients receive an unroutable URL. Carry
+    // title/artist/quality so the proxy resolver can hit the Saavn lane.
     const host = req.get('host') || 'localhost:5000';
     const forwarded = (req.headers['x-forwarded-proto'] as string) || '';
     const proto = forwarded.split(',')[0].trim() || req.protocol || 'http';
-    const proxyUrl = `${proto}://${host}/api/v1/tracks/proxy/${id}`;
+    const proxyParams = new URLSearchParams();
+    if (title) proxyParams.set('title', title);
+    if (artist) proxyParams.set('artist', artist);
+    if (quality) proxyParams.set('quality', quality);
+    const qs = proxyParams.toString();
+    const proxyUrl = `${proto}://${host}/api/v1/tracks/proxy/${id}${qs ? `?${qs}` : ''}`;
     if (!details) {
+      // Resolution failed entirely. Return the proxy URL so the client can
+      // still attempt playback, but never fabricate a quality claim we
+      // cannot honor (the old code advertised "256kbps High Fidelity" for a
+      // URL that would 404).
       return {
         streamUrl: proxyUrl,
         proxyUrl,
-        bitrate: 256,
-        codec: 'Opus 256kbps',
+        bitrate: 0,
+        codec: 'unknown',
         mimeType: 'audio/webm',
-        qualityLabel: '256kbps High Fidelity (Opus)',
+        qualityLabel: 'Unknown',
+        quality: 'low',
+        isLossless: false,
+        source: 'Proxy',
       };
     }
     // Primary: direct upstream URL (no server hop). Fallback: same-origin
