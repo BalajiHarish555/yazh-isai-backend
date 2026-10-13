@@ -50,7 +50,13 @@ export class DeezerService {
   private readonly logger = new Logger(DeezerService.name);
 
   // Session cache (license token + api token). Refreshed when it expires.
-  private session: { licenseToken: string; canLossless: boolean; country: string; at: number } | null = null;
+  private session: {
+    licenseToken: string;
+    apiToken: string;
+    canLossless: boolean;
+    country: string;
+    at: number;
+  } | null = null;
 
   constructor(private cacheService: CacheService) {}
 
@@ -114,8 +120,12 @@ export class DeezerService {
       this.logger.warn('Deezer getUserData returned no license_token (bad ARL?)');
       return null;
     }
+    // checkForm is the per-session api_token that song.getListData requires —
+    // passing 'null' there makes the call silently return no data.
+    const apiToken = results?.checkForm || 'null';
     this.session = {
       licenseToken,
+      apiToken,
       canLossless: !!(opts.web_lossless || opts.mobile_loseless),
       country: results?.COUNTRY || 'XX',
       at: Date.now(),
@@ -284,7 +294,12 @@ export class DeezerService {
     if (!session) return null;
 
     // 2. song.getListData -> TRACK_TOKEN (+ MD5_ORIGIN / FILESIZE_FLAC).
-    const listRes = await this.gwCall<any>('song.getListData', { sng_ids: [trackId] });
+    // Requires the per-session checkForm api_token; 'null' returns no data.
+    const listRes = await this.gwCall<any>(
+      'song.getListData',
+      { sng_ids: [trackId] },
+      session.apiToken,
+    );
     const entry: any = listRes?.data?.[0];
     if (!entry) {
       this.logger.warn(`Deezer song.getListData returned no data for ${trackId}`);
@@ -393,7 +408,11 @@ export class DeezerService {
     if (!session) return { status: 404, headers: {}, stream: null, totalBytes: 0 };
 
     // Get a fresh CDN url for this track.
-    const listRes = await this.gwCall<any>('song.getListData', { sng_ids: [trackId] });
+    const listRes = await this.gwCall<any>(
+      'song.getListData',
+      { sng_ids: [trackId] },
+      session.apiToken,
+    );
     const entry: any = listRes?.data?.[0];
     if (!entry) return { status: 404, headers: {}, stream: null, totalBytes: 0 };
     const src = entry.FALLBACK && entry.FALLBACK.TRACK_TOKEN ? entry.FALLBACK : entry;
@@ -475,9 +494,13 @@ export class DeezerService {
       'Content-Type': 'audio/flac',
       'Accept-Ranges': 'bytes',
     };
-    if (totalBytes > 0) {
+    // Content-Range is only valid on 206 responses. A full-file 200 must not
+    // carry it (RFC 7233) — only advertise Content-Length when known.
+    if (hasRange && totalBytes > 0) {
       outHeaders['Content-Length'] = String(end - start + 1);
       outHeaders['Content-Range'] = `bytes ${start}-${end}/${totalBytes}`;
+    } else if (totalBytes > 0) {
+      outHeaders['Content-Length'] = String(totalBytes);
     }
 
     const { Readable } = await import('stream');
