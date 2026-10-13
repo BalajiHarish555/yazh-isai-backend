@@ -156,6 +156,7 @@ export class TracksController {
     @Query('title') title: string,
     @Query('artist') artist: string,
     @Query('limit') limit?: string,
+    @Query('id') id?: string,
   ) {
     const parsed = Array.isArray(limit) ? NaN : parseInt(limit || '10', 10);
     const n = Number.isFinite(parsed) ? Math.max(1, Math.min(15, Math.floor(parsed))) : 10;
@@ -181,17 +182,32 @@ export class TracksController {
       );
     };
 
+    const pushTrack = (t: any) => {
+      if (isNonTamil(t.title) || isNonTamil(t.artists) || isNonTamil(t.thumbnail)) return;
+      const key = norm(t.title);
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        out.push(t);
+      }
+    };
+
+    // Primary: YouTube Music's own Up Next queue for this video — the same
+    // suggestions the official app would show.
+    if (typeof id === 'string' && id) {
+      try {
+        const upNext = await this.youtubeMusicService.getYouTubeUpNext(id, n);
+        for (const t of upNext || []) pushTrack(t);
+      } catch {
+        // Fall through to Saavn seeds.
+      }
+    }
+
     try {
       const seeds = await this.jioSaavnService.getAutoplaySeeds(title || '', artist || '', n * 2);
       for (const s of seeds) {
         // Thumbnail CDN URLs embed the album slug (e.g. "...-Tollywood-Superhits-Telugu-..."),
         // which catches language-neutral titles the text check alone misses.
-        if (isNonTamil(s.title) || isNonTamil(s.artists) || isNonTamil(s.thumbnail)) continue;
-        const key = norm(s.title);
-        if (key && !seen.has(key)) {
-          seen.add(key);
-          out.push(s);
-        }
+        pushTrack(s);
       }
     } catch {
       // Fall through

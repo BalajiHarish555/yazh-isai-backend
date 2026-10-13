@@ -35,6 +35,14 @@ export class DiscoveryController {
   @Get('taste')
   async getTaste(@Req() req: any, @Query('limit') limit?: string) {
     const userId = req.user?.userId || '';
+    const n = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(30, Math.floor(Number(limit)))) : 12;
+    return this.tasteService.buildUpNext(userId, n);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Get('taste')
+  async getTaste(@Req() req: any, @Query('limit') limit?: string) {
+    const userId = req.user?.userId || '';
     return this.tasteService.getTasteForUser(userId, limit ? parseInt(limit, 10) : 20);
   }
 }

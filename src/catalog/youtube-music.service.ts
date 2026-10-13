@@ -267,6 +267,116 @@ export class YouTubeMusicService implements OnModuleInit {
     return details?.streamUrl || null;
   }
 
+  private parseDurationLabel(label: string): number | undefined {
+    const parts = (label || '').trim().split(':').map((p) => parseInt(p, 10));
+    if (parts.some((n) => !Number.isFinite(n))) return undefined;
+    let total = 0;
+    for (const p of parts) total = total * 60 + p;
+    return total > 0 ? total : undefined;
+  }
+
+  /**
+   * YouTube Music's own Up Next queue (the `next` InnerTube endpoint with
+   * the RD autoplay list): what YT itself would play after this video.
+   * First item is the seed video — skipped. Cached 10 min per video.
+   */
+  async getYouTubeUpNext(videoId: string, limit = 12): Promise<any[]> {
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId || '')) return [];
+    const startTime = Date.now();
+    const cacheKey = `upnext_${videoId}`;
+    const cached = await this.cacheService.get<any[]>(cacheKey);
+    if (cached && cached.length > 0) {
+      this.logger.log(`Cache hit for up-next: ${videoId} (${Date.now() - startTime}ms)`);
+      return cached.slice(0, limit);
+    }
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const response = await fetch(`${this.INNERTUBE_API_BASE}/next`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'X-Origin': 'https://music.youtube.com',
+        },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          context: {
+            client: {
+              clientName: 'WEB_REMIX',
+              clientVersion: '1.20240101.01.00',
+              hl: 'en',
+              gl: 'US',
+            },
+          },
+          videoId,
+          playlistId: `RD${videoId}`,
+          params: 'wAEB',
+        }),
+      });
+      if (!response.ok) throw new Error(`InnerTube next error: ${response.statusText}`);
+      const data: any = await response.json();
+      const tabs: any[] =
+        data?.contents?.singleColumnMusicWatchNextResultsRenderer?.tabbedRenderer
+          ?.watchNextTabbedResultsRenderer?.tabs || [];
+      const queueTab = tabs.find(
+        (t: any) => t?.tabRenderer?.content?.musicQueueRenderer,
+      );
+      const items: any[] =
+        queueTab?.tabRenderer?.content?.musicQueueRenderer?.content
+          ?.playlistPanelRenderer?.contents || [];
+
+      const out: any[] = [];
+      const seen = new Set<string>([videoId]);
+      for (const entry of items) {
+        const v = entry?.playlistPanelVideoRenderer;
+        const id = v?.videoId;
+        const title = v?.title?.runs?.[0]?.text?.trim();
+        if (!id || !title || seen.has(id)) continue;
+        seen.add(id);
+        const artistRuns: any[] = v?.shortBylineText?.runs || v?.longBylineText?.runs || [];
+        const artists = artistRuns
+          .map((r: any) => r?.text)
+          .filter(Boolean)
+          .join('')
+          .replace(/\s*,\s*,+/g, ', ')
+          .trim();
+        const thumbs: any[] = v?.thumbnail?.thumbnails || v?.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || [];
+        let thumbnail = '';
+        if (thumbs.length > 0) {
+          const best = [...thumbs].sort(
+            (a, b) => (b.width || 0) * (b.height || 0) - (a.width || 0) * (a.height || 0),
+          )[0];
+          thumbnail = (best?.url || '').replace(/=w\d+-h\d+-l\d+-rj/, '=w500-h500-l90-rj');
+        }
+        if (!thumbnail) thumbnail = `https://img.youtube.com/vi/${id}/hqdefault.jpg`;
+        const lenRuns: any[] = v?.lengthText?.runs || [];
+        const duration = this.parseDurationLabel(lenRuns.map((r: any) => r?.text).join(''));
+        out.push({
+          id,
+          title,
+          artists: artists || 'Unknown Artist',
+          thumbnail,
+          duration,
+          source: 'Up Next • YouTube Music',
+          reason: 'Up next on YouTube Music',
+        });
+        if (out.length >= limit * 2) break;
+      }
+      if (out.length > 0) {
+        await this.cacheService.set(cacheKey, out, 600);
+      }
+      this.logger.log(`Up-next for ${videoId}: ${out.length} tracks in ${Date.now() - startTime}ms`);
+      return out.slice(0, limit);
+    } catch (error: any) {
+      this.logger.warn(`YouTube up-next failed for ${videoId}: ${error?.message || error}`);
+      return [];
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async searchTracks(query: string) {
     const startTime = Date.now();
     // Normalize so case/whitespace variants ("Vaathi" vs "vaathi ") share one
