@@ -31,10 +31,12 @@ import { ProfilesModule } from './profiles/profiles.module';
     }),
     ServeStaticModule.forRoot({
       rootPath: join(__dirname, '..', 'public'),
-      // NOTE: a plain '/api*' string crashes this package's path-to-regexp
-      // on every miss (500 instead of 404). A RegExp is handled natively
-      // at runtime (cast: this version's typings only declare string[]).
-      exclude: [/^\/api\//] as unknown as string[],
+      // MUST be a bare RegExp (the option's `string[] | RegExp` union), not
+      // an array of RegExps: this package's isRouteExcluded() only special-
+      // cases `paths instanceof RegExp` and runs path-to-regexp() on every
+      // array element — a RegExp *element* crashes path-to-regexp 8 and
+      // turns every SPA deep link / unknown GET into a 500.
+      exclude: /^\/api\//,
       serveStaticOptions: {
         // Entry files must never cache: a stale index.html boots a stale
         // bundle (the classic "I don't see the new UI" bug). Hashed assets

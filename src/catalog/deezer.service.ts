@@ -58,6 +58,16 @@ export class DeezerService {
     at: number;
   } | null = null;
 
+  // Circuit breaker for the external fallback proxy. After 3 consecutive
+  // failures the fallback is skipped for 5 minutes so every song request
+  // doesn't burn a 10-second timeout against a dead upstream.
+  private fallbackFailCount = 0;
+  private fallbackOpenUntil = 0;
+
+  // Set when the ARL comes back anonymous (USER_ID=0) — avoids re-running
+  // getUserData on every track for the next 10 minutes.
+  private arlInvalidUntil = 0;
+
   constructor(private cacheService: CacheService) {}
 
   /** The ARL account cookie. Read from env so no secret is ever committed. */
@@ -68,6 +78,106 @@ export class DeezerService {
   /** Whether FLAC playback is configured at all. */
   isEnabled(): boolean {
     return this.getArl().length > 0;
+  }
+
+  /** Whether Deezer fallback is enabled. */
+  isFallbackEnabled(): boolean {
+    return (
+      process.env.DEEZER_FALLBACK_ENABLED === 'true' &&
+      !!process.env.DEEZER_FALLBACK_API_BASE_URL
+    );
+  }
+
+  /**
+   * Attempt to resolve a track via the Deezer fallback service.
+   * Used when the primary Deezer ARL-based approach fails.
+   */
+  private async resolveViaFallback(
+    title: string,
+    artist: string
+  ): Promise<DeezerFlacDetails | null> {
+    if (!this.isFallbackEnabled()) return null;
+    if (!title) return null;
+
+    // Circuit breaker: after 3 consecutive failures skip the fallback for
+    // 5 minutes so dead upstreams don't add 10s latency to every request.
+    if (Date.now() < this.fallbackOpenUntil) return null;
+
+    const apiBase = process.env.DEEZER_FALLBACK_API_BASE_URL ||
+      'https://dzr.tabs-vs-spaces.wtf';
+    const query = `${title} ${artist}`.trim();
+
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch(
+        `${apiBase}/search?q=${encodeURIComponent(query)}&limit=1`,
+        {
+          headers: { 'User-Agent': UA },
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timer);
+
+      if (!res.ok) {
+        this.logger.warn(
+          `Deezer fallback request failed: ${res.status} ${res.statusText}`
+        );
+        this.fallbackFailCount++;
+        if (this.fallbackFailCount >= 3) {
+          this.fallbackOpenUntil = Date.now() + 5 * 60 * 1000;
+          this.logger.warn('Deezer fallback circuit open — skipping for 5 min');
+        }
+        return null;
+      }
+      this.fallbackFailCount = 0;
+
+      const data = await res.json() as any;
+      const track = (data.data?.[0] as any) || (data.track as any) || (data as any);
+      if (!track) return null;
+
+      // Assume the fallback service returns a direct FLAC URL or similar
+      const flacUrl = (track.url as string) || (track.download_url as string) || (track.stream_url as string);
+      if (!flacUrl) return null;
+
+      // Try to get more details if available
+      const detailRes = await fetch(
+        `${apiBase}/track/${(track.id as string)}`,
+        { headers: { 'User-Agent': UA } }
+      );
+      let detailData: any = {};
+      if (detailRes.ok) {
+        detailData = await detailRes.json();
+      }
+
+      return {
+        streamUrl: flacUrl,
+        trackId: String(track.id),
+        proxyUrl: flacUrl, // For now, use direct URL; could proxy later
+        bitrate: (detailData.bitrate as number) || 1411,
+        codec: (detailData.codec as string) || 'FLAC',
+        mimeType: (detailData.mimeType as string) || 'audio/flac',
+        qualityLabel: (detailData.qualityLabel as string) ||
+          'FLAC 16-bit/44.1kHz (Lossless)',
+        quality: 'high' as const,
+        isLossless: true,
+        source: 'Deezer Fallback',
+        title: (track.title as string) || title,
+        artists: (track.artist as string) || artist,
+        isEncrypted: false, // Assume fallback provides ready-to-play URL
+        fileSize: (detailData.fileSize as number) || 0,
+        duration: (detailData.duration as number) || (track.duration as number) || 0,
+        isrc: (track.isrc as string) || undefined,
+      };
+    } catch (err: any) {
+      this.logger.warn(`Deezer fallback failed: ${err.message || err}`);
+      this.fallbackFailCount++;
+      if (this.fallbackFailCount >= 3) {
+        this.fallbackOpenUntil = Date.now() + 5 * 60 * 1000;
+        this.logger.warn('Deezer fallback circuit open — skipping for 5 min');
+      }
+      return null;
+    }
   }
 
   // ---------------------------------------------------------------- session
@@ -98,8 +208,18 @@ export class DeezerService {
       clearTimeout(timer);
       if (!res.ok) return null;
       const json: any = await res.json();
-      if (json?.error) {
-        this.logger.warn(`Deezer gw ${method} error: ${JSON.stringify(json.error)}`);
+      // gw-light returns `error: []` on success — an empty array is truthy,
+      // so check for actual entries (object with keys, or non-empty array).
+      const err = json?.error;
+      const hasError =
+        err != null &&
+        (Array.isArray(err)
+          ? err.length > 0
+          : typeof err === 'object'
+            ? Object.keys(err).length > 0
+            : !!err);
+      if (hasError) {
+        this.logger.warn(`Deezer gw ${method} error: ${JSON.stringify(err)}`);
         return null;
       }
       return (json?.results ?? null) as T | null;
@@ -112,8 +232,20 @@ export class DeezerService {
   /** Fetch (and cache for 1h) the license token needed by media.deezer.com. */
   private async ensureSession(): Promise<typeof this.session> {
     if (this.session && Date.now() - this.session.at < 60 * 60 * 1000) return this.session;
+    // A bad ARL comes back as an ANONYMOUS session (USER_ID 0) with a guest
+    // license token that has no FLAC rights. Don't re-detect it per track —
+    // back off for 10 minutes and log it once.
+    if (Date.now() < this.arlInvalidUntil) return null;
     const results = await this.gwCall<any>('deezer.getUserData', {});
     if (!results) return null;
+    const userId = results?.USER?.USER_ID;
+    if (!userId) {
+      this.arlInvalidUntil = Date.now() + 10 * 60 * 1000;
+      this.logger.warn(
+        'Deezer ARL invalid or expired (anonymous session, USER_ID=0) — set a fresh DEEZER_ARL from a logged-in browser session',
+      );
+      return null;
+    }
     const opts = results?.USER?.OPTIONS || {};
     const licenseToken = opts.license_token;
     if (!licenseToken) {
@@ -130,9 +262,15 @@ export class DeezerService {
       country: results?.COUNTRY || 'XX',
       at: Date.now(),
     };
-    this.logger.log(
-      `Deezer session ready (lossless=${this.session.canLossless}, country=${this.session.country})`,
-    );
+    if (!this.session.canLossless) {
+      this.logger.warn(
+        `Deezer account ${userId} has no lossless entitlement (country ${this.session.country}) — FLAC unavailable, skipping Deezer lane`,
+      );
+    } else {
+      this.logger.log(
+        `Deezer session ready (lossless=true, country=${this.session.country})`,
+      );
+    }
     return this.session;
   }
 
@@ -173,39 +311,66 @@ export class DeezerService {
     }
   }
 
-  /** MusicBrainz ISRC lookup by title+artist (no key, ~1 req/s). */
-  private async lookupIsrcFromMusicBrainz(title: string, artist: string): Promise<string | null> {
+  // MusicBrainz allows ~1 req/s per IP; bursty search prefetches otherwise
+  // trigger 503s that were silently swallowed (surfacing as "no match" with
+  // no log line). Serialize lookups with a minimum spacing between them.
+  private mbNextAt = 0;
+  private mbChain: Promise<unknown> = Promise.resolve();
+
+  private async mbFetch(url: string, signal: AbortSignal) {
+    const run = async () => {
+      const wait = Math.max(0, this.mbNextAt - Date.now());
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+      this.mbNextAt = Date.now() + 1100;
+      return fetch(url, {
+        headers: { 'User-Agent': 'YazhIsai/1.0 (https://yazh-isai.onrender.com)' },
+        signal,
+      });
+    };
+    const p = this.mbChain.then(run, run);
+    this.mbChain = p.catch(() => undefined);
+    return p;
+  }
+
+  /**
+   * MusicBrainz ISRC lookup by title+artist (no key, ~1 req/s). Returns ALL
+   * candidate ISRCs from the top matches — the first one is often a live/
+   * compilation recording that Deezer doesn't have, so callers try each.
+   */
+  private async lookupIsrcFromMusicBrainz(title: string, artist: string): Promise<string[]> {
     const cacheKey = `mb_isrc_${md5(`${title}|${artist}`.toLowerCase()).slice(0, 16)}`;
-    const cached = await this.cacheService.get<string>(cacheKey);
-    if (cached) return cached;
+    const cached = await this.cacheService.get<string | string[]>(cacheKey);
+    if (Array.isArray(cached)) return cached;
+    if (typeof cached === 'string' && cached) return [cached];
     const clean = (s: string) => (s || '').replace(/["']/g, '').trim();
     const query = `recording:"${clean(title)}"${artist ? ` AND artist:"${clean(artist)}"` : ''}`;
     try {
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
-      const res = await fetch(
-        `https://musicbrainz.org/ws/2/recording/?query=${encodeURIComponent(query)}&fmt=json&limit=5`,
-        {
-          headers: { 'User-Agent': 'YazhIsai/1.0 (https://yazh-isai.onrender.com)' },
-          signal: controller.signal,
-        },
-      );
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const url = `https://musicbrainz.org/ws/2/recording/?query=${encodeURIComponent(query)}&fmt=json&limit=10`;
+      let res = await this.mbFetch(url, controller.signal);
+      if (res.status === 429 || res.status === 503) {
+        await new Promise((r) => setTimeout(r, 1500));
+        res = await this.mbFetch(url, controller.signal);
+      }
       clearTimeout(timer);
-      if (!res.ok) return null;
+      if (!res.ok) {
+        this.logger.warn(`MusicBrainz HTTP ${res.status} for "${title}"`);
+        return [];
+      }
       const j: any = await res.json();
       const recs: any[] = j?.recordings || [];
+      const out: string[] = [];
       for (const rec of recs) {
-        const isrcs: string[] = rec?.isrcs || [];
-        if (isrcs.length > 0) {
-          const isrc = isrcs[0];
-          await this.cacheService.set(cacheKey, isrc, 86400);
-          return isrc;
+        for (const isrc of rec?.isrcs || []) {
+          if (typeof isrc === 'string' && isrc && !out.includes(isrc)) out.push(isrc);
         }
       }
-      return null;
+      if (out.length > 0) await this.cacheService.set(cacheKey, out, 86400);
+      return out;
     } catch (err: any) {
       this.logger.warn(`MusicBrainz ISRC lookup failed: ${err?.message || err}`);
-      return null;
+      return [];
     }
   }
 
@@ -215,41 +380,76 @@ export class DeezerService {
    * Resolve a full-length lossless FLAC stream for a title/artist. Returns
    * null when ARL is unset, the track can't be matched, or the account can't
    * stream lossless — callers fall back to Saavn/YouTube.
+   * 
+   * Now includes fallback to external Deezer service when primary method fails.
    */
   async getBestFlacStream(
     title: string,
     artist: string,
   ): Promise<DeezerFlacDetails | null> {
-    if (!this.isEnabled()) return null;
-    if (!title) return null;
+    // Try primary Deezer method first (requires ARL)
+    if (this.isEnabled()) {
+      if (!title) return null;
 
-    // Cache the whole resolution. The streamUrl is our STABLE decrypting
-    // proxy path (not the expiring CDN url), so it's safe to cache longer.
-    const cacheKey = `dz_flac_${md5(`${title}|${artist}`.toLowerCase()).slice(0, 16)}`;
-    const cached = await this.cacheService.get<DeezerFlacDetails>(cacheKey);
-    if (cached) return cached;
+      // Cache the whole resolution. The streamUrl is our STABLE decrypting
+      // proxy path (not the expiring CDN url), so it's safe to cache longer.
+      const cacheKey = `dz_flac_${md5(`${title}|${artist}`.toLowerCase()).slice(0, 16)}`;
+      const cached = await this.cacheService.get<DeezerFlacDetails>(cacheKey);
+      if (cached) return cached;
 
-    // 1. title/artist -> ISRC (MusicBrainz), then ISRC -> Deezer track id.
-    let isrc = await this.lookupIsrcFromMusicBrainz(title, artist);
-    let track: any = null;
-    if (isrc) {
-      track = await this.lookupTrackByIsrc(isrc);
-    }
-    // Fallback: search Deezer by title/artist directly (public API).
-    if (!track) {
-      track = await this.searchDeezerTrack(title, artist);
-      if (track?.isrc) isrc = track.isrc;
-    }
-    if (!track?.id) {
-      this.logger.log(`Deezer: no match for "${title}" by "${artist}"`);
-      return null;
+      // Validate the ARL session FIRST — a dead/free-tier ARL can never
+      // produce FLAC, so don't burn MusicBrainz quota per track.
+      const session = await this.ensureSession();
+      if (!session) {
+        // Invalid ARL — fall straight through to the external fallback.
+      } else if (!session.canLossless) {
+        // Account has no lossless entitlement — Deezer lane skipped (logged
+        // once by ensureSession), fall through to the external fallback.
+      } else {
+        // 1. title/artist -> ISRC candidates (MusicBrainz), then ISRC -> Deezer
+        // track id. Try each candidate: the first is often a live/comp recording
+        // Deezer doesn't carry (800 "no data").
+        const isrcCandidates = await this.lookupIsrcFromMusicBrainz(title, artist);
+        let track: any = null;
+        let isrc: string | undefined;
+        for (const candidate of isrcCandidates) {
+          track = await this.lookupTrackByIsrc(candidate);
+          if (track?.id) {
+            isrc = candidate;
+            break;
+          }
+        }
+        // Fallback: search Deezer by title/artist directly (public API).
+        if (!track) {
+          track = await this.searchDeezerTrack(title, artist);
+          if (track?.isrc) isrc = track.isrc;
+        }
+        if (!track?.id) {
+          this.logger.log(`Deezer: no match for "${title}" by "${artist}"`);
+          // Fall through to external fallback if enabled
+        } else {
+          const details = await this.resolveByTrackId(track.id, track, isrc ?? undefined);
+          if (details) {
+            await this.cacheService.set(cacheKey, details, 21600);
+            return details;
+          }
+          // Fall through to external fallback if resolve failed
+        }
+      }
     }
 
-    const details = await this.resolveByTrackId(track.id, track, isrc ?? undefined);
-    if (details) {
-      await this.cacheService.set(cacheKey, details, 21600);
+    // Try external fallback if primary method failed or not configured
+    if (this.isFallbackEnabled()) {
+      const fallbackResult = await this.resolveViaFallback(title, artist);
+      if (fallbackResult) {
+        // Cache fallback results for a shorter time (1 hour) since they're less reliable
+        const cacheKey = `dz_fallback_${md5(`${title}|${artist}`.toLowerCase()).slice(0, 16)}`;
+        await this.cacheService.set(cacheKey, fallbackResult, 3600);
+        return fallbackResult;
+      }
     }
-    return details;
+
+    return null;
   }
 
   /** Public Deezer search (no ARL) — fallback when MusicBrainz has no ISRC. */
@@ -465,23 +665,24 @@ export class DeezerService {
       return { status: 502, headers: {}, stream: null, totalBytes: 0 };
     }
 
-    // If not encrypted, just pipe through (preserve upstream status/headers).
-    if (!isEncrypted) {
-      const outHeaders: Record<string, string> = {
-        'Content-Type': upstream.headers.get('content-type') || 'audio/flac',
-        'Accept-Ranges': 'bytes',
-      };
-      const cl = upstream.headers.get('content-length');
-      if (cl) outHeaders['Content-Length'] = cl;
-      const cr = upstream.headers.get('content-range');
-      if (cr) outHeaders['Content-Range'] = cr;
-      return {
-        status: upstream.status,
-        headers: outHeaders,
-        stream: upstream.body as NodeJS.ReadableStream,
-        totalBytes,
-      };
-    }
+     // If not encrypted, just pipe through (preserve upstream status/headers).
+     if (!isEncrypted) {
+       const outHeaders: Record<string, string> = {
+         'Content-Type': upstream.headers.get('content-type') || 'audio/flac',
+         'Accept-Ranges': 'bytes',
+       };
+       const cl = upstream.headers.get('content-length');
+       if (cl) outHeaders['Content-Length'] = cl;
+       const cr = upstream.headers.get('content-range');
+       if (cr) outHeaders['Content-Range'] = cr;
+       this.logger.log(`Deezer proxy serving unencrypted FLAC stream, totalBytes: ${totalBytes}`);
+       return {
+         status: upstream.status,
+         headers: outHeaders,
+         stream: upstream.body as NodeJS.ReadableStream,
+         totalBytes,
+       };
+     }
 
     // Encrypted: decrypt stripes on the fly, then slice to the requested range.
     const key = deezerBlowfishKey(trackId, md5);

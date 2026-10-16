@@ -1,7 +1,7 @@
 /* Yazh Isai service worker — app shell + artwork caching.
  * API calls (/api/*) and audio streams always go to network: cached
  * stream URLs expire and cached API data goes stale fast. */
-const SHELL_CACHE = 'yazh-shell-v1';
+const SHELL_CACHE = 'yazh-shell-v2';
 const IMAGE_CACHE = 'yazh-images-v1';
 const AUDIO_CACHE = 'yazh-audio-v1';
 const MAX_IMAGES = 120;

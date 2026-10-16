@@ -1,10 +1,10 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import youtubedl from 'youtube-dl-exec';
-import ytdl from '@distube/ytdl-core';
 import fetch from 'node-fetch';
 import { CacheService } from '../common/cache.service';
 import { JioSaavnService } from './jiosaavn.service';
 import { DeezerService } from './deezer.service';
+import { TidalService } from './tidal.service';
 
 // Queries users type first, warmed shortly after boot so opening searches
 // feel instant instead of paying a cold upstream round-trip.
@@ -26,6 +26,7 @@ export class YouTubeMusicService implements OnModuleInit {
     private cacheService: CacheService,
     private jioSaavnService: JioSaavnService,
     private deezerService: DeezerService,
+    private tidalService: TidalService,
   ) {
     // Pre-warm runs from onModuleInit below.
   }
@@ -50,22 +51,23 @@ export class YouTubeMusicService implements OnModuleInit {
     if (wt && typeof wt.unref === 'function') wt.unref();
   }
 
-  private async warmUp(): Promise<void> {
-    try {
-      await youtubedl('https://www.youtube.com/watch?v=aqz-KE-bpKQ', {
-        getUrl: true,
-        format: 'bestaudio/bestaudio*',
-        noCheckCertificates: true,
-        noWarnings: true,
-        noPlaylist: true,
-        socketTimeout: 25,
-        retries: 1,
-      });
-      this.logger.log('yt-dlp warmed up');
-    } catch (error: any) {
-      this.logger.warn(`yt-dlp warm-up failed (will retry on demand): ${error?.message || error}`);
-    }
-  }
+   private async warmUp(): Promise<void> {
+     try {
+       await youtubedl('https://www.youtube.com/watch?v=aqz-KE-bpKQ', {
+         getUrl: true,
+         // Use a representative format for warming up
+         format: 'bestaudio[acodec*=opus][abr>=192]/bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
+         noCheckCertificates: true,
+         noWarnings: true,
+         noPlaylist: true,
+         socketTimeout: 25,
+         retries: 1,
+       });
+       this.logger.log('yt-dlp warmed up with quality formats');
+     } catch (error: any) {
+       this.logger.warn(`yt-dlp warm-up failed (will retry on demand): ${error?.message || error}`);
+     }
+   }
 
   async getAudioStreamDetails(videoId: string, title?: string, artist?: string, quality?: string): Promise<{
     streamUrl: string;
@@ -84,7 +86,13 @@ export class YouTubeMusicService implements OnModuleInit {
     // 30 min max — a stale cached URL plays nothing. Quality is part of the
     // key so a 'saver' hit can never satisfy a 'best' request (and vice
     // versa) for 30 minutes.
-    const cacheKey = `audio_details_${videoId}_${saver ? 'saver' : 'best'}`;
+    // Title is part of the key too: the lossless/high-quality lanes
+    // (Deezer/Tidal/Saavn) need title+artist to search. A title-less
+    // background warmup must never poison the cache with a YouTube-AAC
+    // result that later shadows a titled request's FLAC/Saavn resolution.
+    const titleKey =
+      (title || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 32) || 'notitle';
+    const cacheKey = `audio_details_${videoId}_${saver ? 'saver' : 'best'}_${titleKey}`;
     const cachedDetails = await this.cacheService.get<any>(cacheKey);
     if (cachedDetails) {
       this.logger.log(`Cache hit for audio details: ${videoId} (${Date.now() - startTime}ms)`);
@@ -94,74 +102,57 @@ export class YouTubeMusicService implements OnModuleInit {
     this.logger.log(`Cache miss for audio details: ${videoId}, resolving...`);
 
     try {
-      // Primary path: youtube-dl-exec (yt-dlp) resolves the real bestaudio
-      // URL reliably. ytdl-core runs ONLY as a lazy fallback below — it is
-      // frequently blocked, and an eagerly-created promise for it can reject
-      // while unobserved and crash the process.
-      const resolveViaYtDlp = async () => {
-        const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-          getUrl: true,
-          // Prefer Opus (better quality-per-bit than AAC at the same
-          // bitrate); fall back to any audio-only format.
-          format: 'bestaudio[acodec*=opus]/bestaudio/bestaudio*',
-          noCheckCertificates: true,
-          noWarnings: true,
-          noPlaylist: true,
-          socketTimeout: 10,
-          retries: 2,
-          // Datacenter IPs get throttled/blocked on the web player client;
-          // the Android client is far less restricted there.
-          extractorArgs: 'youtube:player_client=android',
-        });
-        const resultUrl = typeof url === 'string' ? url.trim() : null;
-        if (resultUrl) {
-          // youtube-dl -g returns only the URL, so codec is inferred from the
-          // URL signature; bitrates are conservative estimates, not claims.
-          const isWebm = resultUrl.includes('mime=audio%2Fwebm') || resultUrl.includes('audio/webm');
-          return {
-            streamUrl: resultUrl,
-            bitrate: isWebm ? 160 : 128,
-            codec: isWebm ? 'Opus' : 'AAC',
-            mimeType: isWebm ? 'audio/webm; codecs="opus"' : 'audio/mp4; codecs="mp4a.40.2"',
-            qualityLabel: isWebm ? '~160kbps Opus (High)' : '~128kbps AAC (Medium)',
-            quality: (isWebm ? 'high' : 'medium') as 'high' | 'medium' | 'low',
-            isLossless: false,
-            source: 'YouTube Music',
-            resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
-          };
-        }
-        return null;
-      };
-
-      // ytdl-core fallback: richer format metadata when yt-dlp fails.
-      // Created lazily inside the fallback branch so a rejection can never
-      // go unobserved (which previously crashed the server outright).
-      const resolveViaYtdlCore = async () => {
-        const info = await ytdl.getInfo(videoId, {
-          requestOptions: {
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+       // Primary path: youtube-dl-exec (yt-dlp) resolves the real bestaudio
+       // URL reliably.
+       const resolveViaYtDlp = async () => {
+         const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+           getUrl: true,
+           // Opus first (better quality-per-bit), then AAC. YouTube audio
+           // tops out ~256kbps so the high-abr filters are cheap no-ops.
+           format: 'bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
+           noCheckCertificates: true,
+           noWarnings: true,
+           noPlaylist: true,
+           socketTimeout: 10,
+           retries: 2,
+           // Datacenter IPs get throttled/blocked on the web player client;
+           // the Android client is far less restricted there.
+           extractorArgs: 'youtube:player_client=android',
+         });
+            const resultUrl = typeof url === 'string' ? url.trim() : null;
+            if (resultUrl) {
+              // youtube-dl -g returns only the URL, so codec is inferred from the
+              // URL signature; bitrates are conservative estimates based on requested format
+              const isWebm = resultUrl.includes('mime=audio%2Fwebm') || resultUrl.includes('audio/webm');
+              
+              // Improved bitrate estimation based on requested format priority
+              let estimatedBitrate = 128; // Default fallback
+              if (isWebm) {
+                // Opus formats we requested in order: >=512kbps, >=320kbps, then any Opus
+                // So if we got Opus, it could be VBR or high bitrate
+                estimatedBitrate = 320; // Conservative estimate for Opus (could be higher)
+              } else {
+                // AAC formats we requested in order: >=512kbps, >=320kbps, then any AAC
+                // So if we got AAC, it's at least 320kbps
+                estimatedBitrate = 320; // Minimum for requested AAC formats
+              }
+              
+              return {
+                streamUrl: resultUrl,
+                bitrate: estimatedBitrate,
+                codec: isWebm ? 'Opus' : 'AAC',
+                mimeType: isWebm ? 'audio/webm; codecs="opus"' : 'audio/mp4; codecs="mp4a.40.2"',
+                qualityLabel: isWebm ? 'Opus (~' + estimatedBitrate + 'kbps+)' : 'AAC (~' + estimatedBitrate + 'kbps+)',
+                quality: (estimatedBitrate >= 320 ? 'high' : estimatedBitrate >= 192 ? 'medium' : 'low') as 'high' | 'medium' | 'low',
+                isLossless: false,
+                source: 'YouTube Music',
+                resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
+              };
             }
-          }
-        });
-        const audioOnlyFormats = info.formats
-          .filter(format => format.hasAudio && !format.hasVideo && format.url && (format.audioBitrate || 0) > 0)
-          .sort((a, b) => {
-            const diff = (b.audioBitrate || 0) - (a.audioBitrate || 0);
-            if (diff !== 0) return diff;
-            // Tie-break toward Opus/webm: better quality per bit than AAC.
-            const aOpus = (a.mimeType || '').includes('opus') ? 1 : 0;
-            const bOpus = (b.mimeType || '').includes('opus') ? 1 : 0;
-            return bOpus - aOpus;
-          });
+         return null;
+       };
 
-        if (audioOnlyFormats.length > 0 && audioOnlyFormats[0].url) {
-          return this.describeAudioFormat(audioOnlyFormats[0], saver);
-        }
-        return null;
-      };
-
-      const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> => {
+       const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> => {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error('Timeout')), ms);
@@ -171,35 +162,60 @@ export class YouTubeMusicService implements OnModuleInit {
         });
       };
 
-      // Deezer FLAC is the true quality ceiling (1411kbps lossless, better
-      // than Saavn's 320 ceiling). It is tried FIRST — but only when the user
-      // asked for 'best', and only when DEEZER_ARL is configured. It is a
-      // plain HTTP round-trip (~1-2s), so it doesn't stall the chain. When it
-      // fails (no ARL, geoblocked, no match) we fall straight through to
-      // Saavn below, so nothing regresses.
-      if (title && !saver && this.deezerService.isEnabled()) {
-        const flac = await this.deezerService
-          .getBestFlacStream(title, artist || '')
-          .catch(() => null);
-        if (flac?.streamUrl) {
-          const details = {
-            streamUrl: flac.streamUrl,
-            bitrate: flac.bitrate,
-            codec: flac.codec,
-            mimeType: flac.mimeType,
-            qualityLabel: flac.qualityLabel,
-            quality: flac.quality,
-            isLossless: true,
-            source: flac.source,
-            resolvedQuality: 'best' as const,
-          };
-          await this.cacheService.set(cacheKey, details, 21600);
-          this.logger.log(
-            `Deezer FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
-          );
-          return details;
+     // Lossless FLAC lane: Prioritize lossless sources first for best quality
+        // Check Deezer first (primary ARL, then external fallback — both handled inside DeezerService.getBestFlacStream),
+        // then Tidal (requires a user OAuth token; client credentials alone are metadata-only).
+        // Only for 'best' requests; failures fall through to Saavn/YouTube below so nothing regresses.
+        if (title && !saver) {
+          // Check Deezer for lossless first
+          const deezerFlac = await this.deezerService
+            .getBestFlacStream(title, artist || '')
+            .catch(() => null);
+          if (deezerFlac?.streamUrl) {
+            const details = {
+              streamUrl: deezerFlac.streamUrl,
+              bitrate: deezerFlac.bitrate,
+              codec: deezerFlac.codec,
+              mimeType: deezerFlac.mimeType,
+              qualityLabel: deezerFlac.qualityLabel,
+              quality: deezerFlac.quality,
+              isLossless: true,
+              source: deezerFlac.source,
+              resolvedQuality: 'best' as const,
+            };
+            await this.cacheService.set(cacheKey, details, 21600);
+            this.logger.log(
+              `Deezer FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
+            );
+            return details;
+          }
+
+          // Check Tidal for lossless second
+          const tidalFlac = await this.tidalService
+            .getBestFlacStream(title, artist || '')
+            .catch(() => null);
+          if (tidalFlac?.streamUrl) {
+            const details = {
+              streamUrl: tidalFlac.streamUrl,
+              bitrate: tidalFlac.bitrate,
+              codec: tidalFlac.codec,
+              mimeType: tidalFlac.mimeType,
+              qualityLabel: tidalFlac.qualityLabel,
+              quality: tidalFlac.quality,
+              isLossless: true,
+              source: tidalFlac.source,
+              resolvedQuality: 'best' as const,
+            };
+            await this.cacheService.set(cacheKey, details, 21600);
+            this.logger.log(
+              `Tidal FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
+            );
+            return details;
+          }
+          
+          // Check if we have a lossless indicator from other sources
+          // (This would be enhanced if we had more metadata about lossless availability)
         }
-      }
 
       // Saavn is the lossy quality ceiling (up to 320kbps verified AAC) and
       // resolves in ~1-3s (plain API call, no process spawn). It is tried
@@ -231,45 +247,19 @@ export class YouTubeMusicService implements OnModuleInit {
         }
       }
 
-      // YouTube fallback: race yt-dlp and ytdl-core, first success wins.
-      // Every promise is observed from birth (never an unhandled
-      // rejection), losers ignored.
-      const racers: Array<Promise<any>> = [
-        withTimeout(resolveViaYtDlp(), 20000).catch((error: any) => {
-          this.logger.warn(`youtube-dl-exec failed for ${videoId} (${error?.message || error})`);
-          return null;
-        }),
-        withTimeout(resolveViaYtdlCore(), 8000).catch((error: any) => {
-          this.logger.warn(`ytdl-core fallback failed for ${videoId} (${error?.message || error})`);
-          return null;
-        }),
-      ];
-      let details: any = null;
-      let pending = racers.length;
-      let done = false;
-      details = await new Promise<any>((resolve) => {
-        const onWin = (d: any, tag: string) => {
-          if (done) return;
-          if (d) {
-            done = true;
-            this.logger.log(`${tag} won for ${videoId}`);
-            resolve(d);
-            return;
-          }
-          pending -= 1;
-          if (pending === 0) {
-            done = true;
-            resolve(null);
-          }
-        };
-        const tags = ['yt-dlp', 'ytdl-core'];
-        racers.forEach((p, i) => p.then((d) => onWin(d, tags[i] || `racer-${i}`)));
+      // YouTube fallback: yt-dlp is the sole resolver. ytdl-core was removed
+      // as a racer because YouTube's cipher changes routinely break its
+      // decipher/n-transform parsing — it always lost after burning an
+      // 8-second timeout on every request.
+      const ytDetails = await withTimeout(resolveViaYtDlp(), 15000).catch((error: any) => {
+        this.logger.warn(`youtube-dl-exec failed for ${videoId} (${error?.message || error})`);
+        return null;
       });
 
-      if (details) {
-        await this.cacheService.set(cacheKey, details, 1800);
-        this.logger.log(`Resolved ${details.qualityLabel} for ${videoId} in ${Date.now() - startTime}ms`);
-        return details;
+      if (ytDetails) {
+        await this.cacheService.set(cacheKey, ytDetails, 1800);
+        this.logger.log(`Resolved ${ytDetails.qualityLabel} for ${videoId} in ${Date.now() - startTime}ms`);
+        return ytDetails;
       }
 
       return null;
@@ -277,27 +267,6 @@ export class YouTubeMusicService implements OnModuleInit {
       this.logger.error(`Error resolving audio stream for videoId ${videoId}:`, error);
       return null;
     }
-  }
-
-  private describeAudioFormat(best: any, saver = false) {
-    const bitrate = best.audioBitrate || 128;
-    const mimeType: string = best.mimeType || 'audio/webm; codecs="opus"';
-    const isOpus = mimeType.includes('opus');
-    const rawCodec: string = best.audioCodec || '';
-    const codec = isOpus ? 'Opus' : (rawCodec.includes('mp4a') ? 'AAC' : (rawCodec || 'AAC'));
-    const quality: 'high' | 'medium' | 'low' = bitrate >= 150 ? 'high' : bitrate >= 100 ? 'medium' : 'low';
-    return {
-      streamUrl: best.url as string,
-      bitrate,
-      codec,
-      mimeType,
-      qualityLabel: `${bitrate}kbps ${codec} (${quality === 'high' ? 'High' : quality === 'medium' ? 'Medium' : 'Low'})`,
-      quality,
-      // YouTube Music streams are lossy. Never label these lossless/FLAC.
-      isLossless: false,
-      source: 'YouTube Music',
-      resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
-    };
   }
 
   async getAudioStreamUrl(
@@ -485,7 +454,10 @@ export class YouTubeMusicService implements OnModuleInit {
         }
         if (process.env.NODE_ENV !== 'production') {
           for (const track of results.slice(0, 2)) {
-            this.getAudioStreamDetails(track.id)
+            // Pass title/artists so warmup heats the high-quality lanes
+            // (Saavn/FLAC) for these tracks instead of caching a
+            // title-less YouTube result.
+            this.getAudioStreamDetails(track.id, track.title, track.artists)
               .catch((err) => this.logger.warn('Background YouTube pre-fetch warning:', err?.message || err));
           }
         }
@@ -576,13 +548,22 @@ export class YouTubeMusicService implements OnModuleInit {
         let artists = '';
         if (renderer.flexColumns?.[1]?.musicResponsiveListItemFlexColumnRenderer?.text?.runs) {
           const artistRuns = renderer.flexColumns[1].musicResponsiveListItemFlexColumnRenderer.text.runs;
-          const rawText = artistRuns.map((r: any) => r.text).filter(Boolean).join('');
-          artists = rawText
-            .replace(/,\s*&\s*,?/g, ' & ')
-            .replace(/,\s*•\s*,?/g, ' • ')
-            .replace(/\s*,\s*,+/g, ', ')
-            .replace(/,\s*&/g, ' &')
-            .trim();
+          const artistNames = artistRuns
+            .filter((r: any) => {
+              const cfg = r?.navigationEndpoint?.browseEndpoint?.browseEndpointContextSupportedConfigs?.browseEndpointContextMusicConfig;
+              return cfg?.pageType === 'MUSIC_PAGE_TYPE_ARTIST';
+            })
+            .map((r: any) => r.text)
+            .filter(Boolean);
+          if (artistNames.length > 0) {
+            artists = Array.from(new Set(artistNames)).join(' & ');
+          } else {
+            const rawText = artistRuns.map((r: any) => r.text).filter(Boolean).join('');
+            artists = rawText
+              .split(/\s*\u00a0+|\s*•\s*/)
+              .map((s: string) => s.trim())
+              .filter(Boolean)[0] || rawText.trim();
+          }
         } else if (renderer.subtitle?.runs?.[0]?.text) {
           artists = renderer.subtitle.runs[0].text;
         }

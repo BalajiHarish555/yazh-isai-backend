@@ -28,6 +28,11 @@ export class ProfilesController {
     return this.profilesService.recordPlay(req.user?.userId || '', dto);
   }
 
+  @Post('me/searches')
+  async recordSearches(@Req() req: any, @Body() dto: any) {
+    return this.profilesService.recordSearches(req.user?.userId || '', dto);
+  }
+
   @Get('me/library')
   async getLibrary(@Req() req: any) {
     return this.profilesService.getLibrary(req.user?.userId || '');

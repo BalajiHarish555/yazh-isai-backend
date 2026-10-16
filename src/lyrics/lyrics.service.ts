@@ -11,6 +11,16 @@ interface LyricsResponse {
   error?: string;
 }
 
+// Hard overall budget for one /lyrics request. Providers time out
+// individually (5-6s) but stacked query variations could otherwise stall
+// the caller — and the UI spinner — for minutes on songs nobody knows.
+// The deadline only bounds the HTTP response; a provider that finishes
+// later still writes its result to cache for the next open.
+const LYRICS_DEADLINE_MS = 9000;
+
+// Remember "not found" briefly so re-opening the same song is instant.
+const LYRICS_NEGATIVE_TTL_S = 120;
+
 @Injectable()
 export class LyricsService {
   private readonly logger = new Logger(LyricsService.name);
@@ -172,10 +182,51 @@ export class LyricsService {
       this.logger.log(`Cache hit for lyrics: ${artist} - ${track} (took ${Date.now() - startTime}ms)`);
       if (typeof cached === 'string') return { lyrics: cached, synced: null };
       if (cached.lyrics) return { lyrics: cached.lyrics, synced: cached.synced || null };
+      if (cached.negative) {
+        this.logger.log(`Negative cache hit (recently not found): "${artist}" - "${track}"`);
+        return null;
+      }
     }
 
     this.logger.log(`Fetching lyrics for: "${artist}" - "${track}"`);
 
+    const work = this.fetchFromProviders(artist, track, cacheKey, startTime)
+      .catch((error: any) => {
+        this.logger.error(`Lyrics provider fan-out failed for "${artist}" - "${track}":`, error?.message);
+        return null;
+      });
+
+    const result = await Promise.race([
+      work,
+      new Promise<null>((resolve) => {
+        const timer = setTimeout(() => resolve(null), LYRICS_DEADLINE_MS);
+        // Do not hold the event loop open for the full budget.
+        (timer as any).unref?.();
+      }),
+    ]);
+
+    if (!result) {
+      this.logger.log(
+        `No lyrics within ${LYRICS_DEADLINE_MS}ms budget (or no match) for: "${artist}" - "${track}" (took ${Date.now() - startTime}ms)`,
+      );
+      // Negative-cache both timeouts and clean misses. If a late provider
+      // result arrives afterwards it overwrites this with the real lyrics.
+      await this.cacheService.set(cacheKey, { negative: true }, LYRICS_NEGATIVE_TTL_S);
+    }
+
+    return result;
+  }
+
+  /**
+   * Sequential provider fan-out. Returns null when no provider has the
+   * song; success is cached here for one day.
+   */
+  private async fetchFromProviders(
+    artist: string,
+    track: string,
+    cacheKey: string,
+    startTime: number,
+  ): Promise<{ lyrics: string; synced: string | null } | null> {
     // Try each provider in order until we find lyrics
     for (const provider of this.providers) {
       try {

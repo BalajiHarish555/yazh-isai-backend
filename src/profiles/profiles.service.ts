@@ -1,6 +1,7 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { Inject } from '@nestjs/common';
+import { sanitizeHistoryEvent, sanitizeSearchQueries } from '../discovery/taste-profile.service';
 
 const PROFILE_FIELDS = [
   'displayName',
@@ -158,30 +159,55 @@ export class ProfilesService {
       where: { userId },
       orderBy: { createdAt: 'desc' },
       take,
-      include: { track: { include: { artists: { include: { artist: true } } } } },
     });
   }
 
   async recordPlay(userId: string, dto: any) {
-    const trackId = typeof dto?.trackId === 'string' ? dto.trackId : '';
-    if (!trackId) return { recorded: false, reason: 'trackId is required' };
+    // Snapshot row: external track ids (YouTube/Saavn) are legal here —
+    // what was heard travels with the event instead of a catalog FK.
+    const row = sanitizeHistoryEvent(userId, dto);
+    if (!row) return { recorded: false, reason: 'trackId and title are required' };
 
-    // ListeningEvent.trackId is a FK to the catalog Track table, so
-    // external ids (e.g. YouTube video ids) cannot be recorded — skip them
-    // instead of crashing on a constraint violation.
-    const track = await this.prisma.track.findUnique({ where: { id: trackId } });
-    if (!track) return { recorded: false, reason: 'track is not in the local catalog' };
+    const event = await this.prisma.listeningEvent.create({ data: row as any });
 
-    const event = await this.prisma.listeningEvent.create({
-      data: {
-        userId,
-        trackId,
-        position: Number(dto?.position) || 0,
-        duration: Number(dto?.duration) || 0,
-        completed: dto?.completed === true,
-        eventType: typeof dto?.eventType === 'string' ? dto.eventType.slice(0, 50) : 'play',
-      },
-    });
+    // Bounded retention: age-prune always; hard-cap the per-user tail so a
+    // heavy listener never grows the table without bound.
+    const cutoff = Date.now() - 180 * 86400000;
+    const [old, capAnchor] = await Promise.all([
+      this.prisma.listeningEvent.findFirst({
+        where: { userId, createdAt: { lt: new Date(cutoff) } },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      }),
+      this.prisma.listeningEvent.findFirst({
+        where: { userId },
+        orderBy: { createdAt: 'desc' },
+        skip: 500,
+        select: { createdAt: true },
+      }),
+    ]);
+    const or: any[] = [];
+    if (old) or.push({ createdAt: { lt: new Date(cutoff) } });
+    if (capAnchor) or.push({ createdAt: { lte: capAnchor.createdAt } });
+    if (or.length > 0) {
+      await this.prisma.listeningEvent
+        .deleteMany({ where: { userId, OR: or } })
+        .catch(() => undefined);
+    }
+
     return { recorded: true, event };
+  }
+
+  async recordSearches(userId: string, dto: any) {
+    const queries = sanitizeSearchQueries(dto?.queries);
+    if (queries.length === 0) return { recorded: 0 };
+    await this.prisma.searchIntent.createMany({
+      data: queries.map((query) => ({ userId, query })),
+    });
+    const cutoff = Date.now() - 180 * 86400000;
+    await this.prisma.searchIntent
+      .deleteMany({ where: { userId, createdAt: { lt: new Date(cutoff) } } })
+      .catch(() => undefined);
+    return { recorded: queries.length };
   }
 }

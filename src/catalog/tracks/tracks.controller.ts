@@ -11,11 +11,16 @@ import { JioSaavnService } from '../jiosaavn.service';
 // either garbage or an attempt to make us spawn processes/fetch URLs for
 // attacker input (SSRF) and poison caches under attacker-chosen keys.
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+const SAAVN_ID_RE = /^saavn-[A-Za-z0-9_-]+$/;
 
 function assertVideoId(id: string) {
   if (!VIDEO_ID_RE.test(id || '')) {
     throw new BadRequestException('Invalid track id');
   }
+}
+
+function isSaavnId(id: string): boolean {
+  return SAAVN_ID_RE.test(id || '');
 }
 
 @Controller('tracks')
@@ -43,6 +48,10 @@ export class TracksController {
     @Query('artist') artist?: string,
     @Query('quality') quality?: string,
   ): Promise<void> {
+    if (isSaavnId(id)) {
+      await this.proxySaavnStream(id, req, res, title, artist, quality);
+      return;
+    }
     assertVideoId(id);
     const fail = (code: number, msg: string) => {
       if (!res.headersSent) {
@@ -134,6 +143,95 @@ export class TracksController {
     }
   }
 
+  private async proxySaavnStream(
+    id: string,
+    req: Request,
+    res: Response,
+    title?: string,
+    artist?: string,
+    quality?: string,
+  ): Promise<void> {
+    const fail = (code: number, msg: string) => {
+      if (!res.headersSent) {
+        res.status(code).send(msg);
+      } else {
+        try {
+          res.end();
+        } catch {
+          // ignore
+        }
+      }
+    };
+    const q = quality === 'saver' ? 'saver' : 'best';
+    let streamUrl: string | null = null;
+    try {
+      const details = await this.jioSaavnService.getStreamBySongId(id, q);
+      streamUrl = details?.streamUrl || null;
+    } catch (err) {
+      console.error('Saavn proxy resolve error:', err);
+    }
+    if (!streamUrl) {
+      fail(404, 'Stream not found');
+      return;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const range = req.headers.range;
+      const upstream = await fetch(streamUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Referer: 'https://www.jiosaavn.com/',
+          ...(range ? { Range: range } : {}),
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!upstream.ok && upstream.status !== 206) {
+        console.error(`Saavn proxy upstream ${upstream.status} for ${id}`);
+        fail(502, 'Upstream audio unavailable');
+        return;
+      }
+      res.status(upstream.status);
+      res.setHeader('Content-Type', upstream.headers.get('content-type') || 'audio/mp4');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Accept-Ranges', 'bytes');
+      const len = upstream.headers.get('content-length');
+      if (len) res.setHeader('Content-Length', len);
+      const contentRange = upstream.headers.get('content-range');
+      if (contentRange) res.setHeader('Content-Range', contentRange);
+      const body: any = upstream.body;
+      if (!body || typeof body.pipe !== 'function') {
+        fail(502, 'Empty upstream response');
+        return;
+      }
+      await new Promise<void>((resolve, reject) => {
+        body.on('error', reject);
+        res.on('error', reject);
+        res.on('close', () => {
+          try {
+            body.destroy();
+          } catch {
+            // ignore
+          }
+          resolve();
+        });
+        body.pipe(res);
+      });
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        fail(504, 'Upstream audio timed out');
+        return;
+      }
+      console.error('Saavn proxy error:', err?.message || err);
+      fail(502, 'Saavn proxy error');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   @Throttle({ default: { limit: 60, ttl: 60000 } })
   @Get('stream/:id')
   async getStreamUrl(
@@ -143,11 +241,6 @@ export class TracksController {
     @Query('artist') artist?: string,
     @Query('quality') quality?: string,
   ) {
-    assertVideoId(id);
-    const details = await this.youtubeMusicService.getAudioStreamDetails(id, title, artist, quality);
-    // Build the fallback proxy URL from the request host — never hardcode
-    // localhost, or LAN/cloud clients receive an unroutable URL. Carry
-    // title/artist/quality so the proxy resolver can hit the Saavn lane.
     const host = req.get('host') || 'localhost:5000';
     const forwarded = (req.headers['x-forwarded-proto'] as string) || '';
     const proto = forwarded.split(',')[0].trim() || req.protocol || 'http';
@@ -157,6 +250,32 @@ export class TracksController {
     if (quality) proxyParams.set('quality', quality);
     const qs = proxyParams.toString();
     const proxyUrl = `${proto}://${host}/api/v1/tracks/proxy/${id}${qs ? `?${qs}` : ''}`;
+
+    if (isSaavnId(id)) {
+      const q = quality === 'saver' ? 'saver' : 'best';
+      const details = await this.jioSaavnService.getStreamBySongId(id, q).catch(() => null);
+      if (!details) {
+        return {
+          streamUrl: proxyUrl,
+          proxyUrl,
+          bitrate: 0,
+          codec: 'unknown',
+          mimeType: 'audio/webm',
+          qualityLabel: 'Unknown',
+          quality: 'low',
+          isLossless: false,
+          source: 'Proxy',
+        };
+      }
+      return {
+        ...details,
+        streamUrl: details.streamUrl,
+        proxyUrl,
+      };
+    }
+
+    assertVideoId(id);
+    const details = await this.youtubeMusicService.getAudioStreamDetails(id, title, artist, quality);
     if (!details) {
       // Resolution failed entirely. Return the proxy URL so the client can
       // still attempt playback, but never fabricate a quality claim we

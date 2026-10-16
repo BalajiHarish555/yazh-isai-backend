@@ -87,22 +87,46 @@ export class JioSaavnService {
   }
 
   private async verifyStream(url: string): Promise<boolean> {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 6000);
+    const headers = { 'User-Agent': UA, Referer: 'https://www.jiosaavn.com/' };
+    const isFullAudio = (type: string, length: number) =>
+      // Must be audio and plausibly a full song (>500KB), not an error page.
+      type.includes('audio') && length > 500_000;
+    // 1. Cheap HEAD check first.
+    const headController = new AbortController();
+    const headTimer = setTimeout(() => headController.abort(), 6000);
     try {
       const response = await fetch(url, {
         method: 'HEAD',
-        signal: controller.signal,
-        headers: { 'User-Agent': UA, Referer: 'https://www.jiosaavn.com/' },
+        signal: headController.signal,
+        headers,
       });
-      clearTimeout(timeoutId);
-      if (!response.ok) return false;
-      const type = response.headers.get('content-type') || '';
-      const length = Number(response.headers.get('content-length') || '0');
-      // Must be audio and plausibly a full song (>500KB), not an error page.
-      return type.includes('audio') && length > 500_000;
+      clearTimeout(headTimer);
+      if (response.ok) {
+        const type = response.headers.get('content-type') || '';
+        const length = Number(response.headers.get('content-length') || '0');
+        if (isFullAudio(type, length)) return true;
+      }
     } catch {
-      clearTimeout(timeoutId);
+      clearTimeout(headTimer);
+    }
+    // 2. Some CDNs reject or misreport HEAD — fall back to a 1KB ranged GET.
+    // A 206 with a content-range (or an audio content-type) proves the URL
+    // serves real bytes; an error page comes back 200 text/html instead.
+    const getController = new AbortController();
+    const getTimer = setTimeout(() => getController.abort(), 6000);
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        signal: getController.signal,
+        headers: { ...headers, Range: 'bytes=0-1023' },
+      });
+      clearTimeout(getTimer);
+      if (!response.ok && response.status !== 206) return false;
+      const type = response.headers.get('content-type') || '';
+      if (type.includes('audio')) return true;
+      return response.status === 206 && !!response.headers.get('content-range');
+    } catch {
+      clearTimeout(getTimer);
       return false;
     }
   }
@@ -158,7 +182,14 @@ export class JioSaavnService {
     artist: string,
     quality: 'best' | 'saver' = 'best',
   ): Promise<SaavnStreamDetails | null> {
-    const cleanTitle = this.normalizeTitle(title);
+    // The frontend sometimes bundles display metadata into the title
+    // ("Minsara Kanna - Srinivaas & ... • A.R.RAHMAN VIBRATION • 6:20").
+    // The bullet (•) is this app's own metadata separator — a real song
+    // title never contains it — so cut the tail before matching. (The
+    // artist side already does this in artistTokens; the title side did
+    // not, which sank the token-overlap score below the threshold.)
+    const rawTitle = (title || '').split('•')[0].trim();
+    const cleanTitle = this.normalizeTitle(rawTitle);
     if (!cleanTitle) return null;
     const artistTokens = this.artistTokens(artist);
     const primary = this.primaryArtist(artist);
@@ -166,6 +197,8 @@ export class JioSaavnService {
     const cacheKey = `saavn_stream_${quality}_${cleanTitle}_${artistTokens.slice(0, 2).join('_')}`;
     const cached = await this.cacheService.get<SaavnStreamDetails>(cacheKey);
     if (cached) {
+      // Short-TTL negative sentinel (see below) — skip repeat upstream calls.
+      if ((cached as any).__saavnMiss) return null;
       this.logger.log(`Saavn cache hit (${quality}): ${title} - ${artist}`);
       return cached;
     }
@@ -190,8 +223,12 @@ export class JioSaavnService {
         .sort((a, b) => b.score - a.score);
 
       for (const { item, score } of ranked) {
-        // Title must strongly match AND at least one artist token must hit.
-        if (score < 4) continue;
+        // Score 3 = exact title OR (partial title + artist hit). The old
+        // threshold of 4 required BOTH a strong title match AND an artist
+        // hit, which rejected many correct songs whose Saavn metadata
+        // differs slightly from the YouTube title (e.g. "(From "Master")"
+        // suffixes, alternate transliterations).
+        if (score < 3) continue;
         const more = item?.more_info || {};
         const encrypted: string = more.encrypted_media_url || '';
         if (!encrypted) continue;
@@ -216,7 +253,7 @@ export class JioSaavnService {
             quality: tier.q,
             isLossless: false,
             source: 'JioSaavn',
-            title: item?.title || title,
+            title: item?.title || rawTitle,
             artists: item?.subtitle || artist,
           };
           await this.cacheService.set(cacheKey, details, 21600);
@@ -229,6 +266,84 @@ export class JioSaavnService {
     }
 
     this.logger.log(`No high-confidence Saavn match for: ${title} - ${artist}`);
+    // Remember misses briefly (5 min) so repeated plays/searches for an
+    // unmatchable track don't hammer the upstream API. Catalog gaps this
+    // persistent are re-checked soon enough; successes cache for 6h.
+    await this.cacheService.set(cacheKey, { __saavnMiss: true } as any, 300);
+    return null;
+  }
+
+  /**
+   * Resolve a stream directly from a JioSaavn song ID (the raw id that
+   * trending/autoplay prefix with "saavn-"). Unlike getBestStream this
+   * does no title search — the caller already knows the exact song.
+   */
+  async getStreamBySongId(
+    songId: string,
+    quality: 'best' | 'saver' = 'best',
+  ): Promise<SaavnStreamDetails | null> {
+    const cleanId = (songId || '').replace(/^saavn-/, '').trim();
+    if (!cleanId || !/^[A-Za-z0-9_-]+$/.test(cleanId)) return null;
+
+    const cacheKey = `saavn_stream_id_${quality}_${cleanId}`;
+    const cached = await this.cacheService.get<SaavnStreamDetails>(cacheKey);
+    if (cached) {
+      if ((cached as any).__saavnMiss) return null;
+      this.logger.log(`Saavn ID cache hit (${quality}): ${cleanId}`);
+      return cached;
+    }
+
+    const data = await this.fetchJson(
+      `${SAAVN_API}?__call=song.getDetails&cc=in&_format=json&_marker=0&api_version=4&ctx=web6dot0&pids=${encodeURIComponent(cleanId)}`,
+    );
+    const songs: any = data?.songs || data;
+    const item: any = Array.isArray(songs) ? songs[0] : songs;
+    const more = item?.more_info || {};
+    const encrypted: string = more.encrypted_media_url || item?.encrypted_media_url || '';
+    if (!encrypted) {
+      await this.cacheService.set(cacheKey, { __saavnMiss: true } as any, 300);
+      return null;
+    }
+    const raw = this.decryptMediaUrl(encrypted);
+    if (!raw) {
+      await this.cacheService.set(cacheKey, { __saavnMiss: true } as any, 300);
+      return null;
+    }
+
+    const tiers =
+      quality === 'saver'
+        ? [{ suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const }]
+        : [
+            { suffix: '_320.mp4', bitrate: 320, label: '320kbps AAC (High)', q: 'high' as const },
+            { suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const },
+          ];
+
+    for (const tier of tiers) {
+      if (tier.suffix === '_320.mp4' && more['320kbps'] !== 'true') continue;
+      const url: string = raw.replace('_96.mp4', tier.suffix);
+      if (url === raw || !url.includes(tier.suffix)) continue;
+      if (!(await this.verifyStream(url))) {
+        this.logger.log(`Saavn ID ${tier.bitrate} URL failed verification for: ${cleanId}`);
+        continue;
+      }
+      const details: SaavnStreamDetails = {
+        streamUrl: url,
+        bitrate: tier.bitrate,
+        codec: 'AAC',
+        mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+        qualityLabel: tier.label,
+        quality: tier.q,
+        isLossless: false,
+        source: 'JioSaavn',
+        title: item?.title || '',
+        artists: item?.subtitle || '',
+      };
+      await this.cacheService.set(cacheKey, details, 21600);
+      this.logger.log(`Saavn ID ${tier.bitrate}kbps resolved: ${cleanId}`);
+      return details;
+    }
+
+    await this.cacheService.set(cacheKey, { __saavnMiss: true } as any, 300);
     return null;
   }
 

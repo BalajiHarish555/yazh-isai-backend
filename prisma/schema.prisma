@@ -27,6 +27,8 @@ model User {
   playlists       Playlist[]
   sharedPlaylists SharedPlaylist[]
   history         ListeningEvent[]
+  reelEvents      ReelEvent[]
+  searchIntents   SearchIntent[]
   refreshTokens   RefreshToken[]
 }
 
@@ -120,8 +122,7 @@ model Track {
   artists          TrackArtist[]
   playlists        PlaylistTrack[]
   likedBy          LikedTrack[]
-  history          ListeningEvent[]
-  createdAt        DateTime         @default(now())
+  createdAt        DateTime @default(now())
   updatedAt        DateTime         @updatedAt
 
   @@index([title])
@@ -225,18 +226,63 @@ model RefreshToken {
   @@index([hashedToken])
 }
 
+// Listening history. trackId is intentionally NOT an FK: real listening
+// happens on external providers (YouTube/Saavn ids) that never appear in the
+// local catalog — so each event carries a metadata SNAPSHOT (title/artist/
+// language/mood/era/…) of what was actually heard. Taste learning reads the
+// snapshot; eventType: play | complete | skip | replay.
 model ListeningEvent {
   id        String   @id @default(uuid())
   userId    String
   trackId   String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  track     Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  title     String
+  artist    String   @default("")
+  composer  String?
+  language  String?
+  genre     String?
+  mood      String?
+  era       String?
+  source    String?
   position  Int
   duration  Int
   completed Boolean
   eventType String
   createdAt DateTime @default(now())
 
-  @@index([userId])
+  @@index([userId, createdAt])
   @@index([trackId])
+}
+
+// Reels interaction events (impression/skip/play/like/not_interested/...).
+// trackId is deliberately NOT an FK: reel tracks come from external providers
+// (YouTube/Saavn ids), which never appear in the local catalog Track table.
+model ReelEvent {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trackId   String
+  title     String?
+  artist    String?
+  feedId    String?
+  eventType String
+  mood      String?
+  dwellMs   Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([userId, eventType, createdAt])
+  @@index([userId, trackId])
+  @@index([createdAt])
+}
+
+// Recent search queries — search intent is a taste signal (language, era,
+// artist curiosity) and feeds candidate-query generation for the For You feed.
+model SearchIntent {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  query     String
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
 }
