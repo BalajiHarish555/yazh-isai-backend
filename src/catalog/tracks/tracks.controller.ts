@@ -2,6 +2,7 @@ import { Controller, Get, Post, Body, Param, Query, Res, Req, UseGuards, BadRequ
 import { Throttle } from '@nestjs/throttler';
 import { Response, Request } from 'express';
 import fetch from 'node-fetch';
+import sharp from 'sharp';
 import { JwtAuthGuard } from '../../auth/guards/jwt-auth.guard';
 import { TracksService } from './tracks.service';
 import { YouTubeMusicService } from '../youtube-music.service';
@@ -23,6 +24,58 @@ function isSaavnId(id: string): boolean {
   return SAAVN_ID_RE.test(id || '');
 }
 
+// ---- Artwork optimization (GET /tracks/artwork) -------------------------
+// Covers arrive as full-size JPEGs; the client asks for a pixel width and we
+// resize + re-encode to WebP here, so phones never download a 1000px file to
+// draw a 120px tile. SSRF guard: https + exact/suffix host allowlist, and the
+// final URL after redirects is re-checked (node-fetch follows redirects).
+const ART_WORK_HOSTS = [
+  // Observed live: c.saavncdn.com (JioSaavn covers), yt3.googleusercontent.com
+  // (YouTube channel art), images.unsplash.com (home hero). Suffix matches
+  // cover CDN edge subdomains (lh3., encrypted-tbn0., i., ...).
+  'saavncdn.com',
+  'googleusercontent.com',
+  'ytimg.com',
+  'gstatic.com',
+  'images.unsplash.com',
+  'i.scdn.co',
+  'sndcdn.com',
+  'static.toiimg.com',
+];
+const ART_MAX_BYTES = 12 * 1024 * 1024;
+const ART_CACHE_MAX = 160;
+
+function allowedArtUrl(raw: string): URL | null {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'https:') return null;
+    const host = u.hostname.toLowerCase();
+    if (!ART_WORK_HOSTS.some((h) => host === h || host.endsWith('.' + h))) return null;
+    return u;
+  } catch {
+    return null;
+  }
+}
+
+/** Insertion-ordered LRU (Map re-insertion on hit) — artwork is immutable
+ *  enough for process-lifetime caching and keeps refreshes instant. */
+const artCache = new Map<string, Buffer>();
+function artCacheGet(key: string): Buffer | undefined {
+  const hit = artCache.get(key);
+  if (hit) {
+    artCache.delete(key);
+    artCache.set(key, hit);
+  }
+  return hit;
+}
+function artCacheSet(key: string, value: Buffer) {
+  artCache.set(key, value);
+  if (artCache.size > ART_CACHE_MAX) {
+    const oldest = artCache.keys().next().value;
+    if (oldest !== undefined) artCache.delete(oldest);
+  }
+}
+
 @Controller('tracks')
 export class TracksController {
   constructor(
@@ -36,6 +89,56 @@ export class TracksController {
   async searchYouTube(@Query('q') q: string) {
     const query = typeof q === 'string' ? q.slice(0, 100) : '';
     return this.youtubeMusicService.searchTracks(query);
+  }
+
+  @Throttle({ default: { limit: 120, ttl: 60000 } })
+  @Get('artwork')
+  async artwork(@Query('url') url: string, @Res() res: Response, @Query('w') w?: string): Promise<void> {
+    const target = typeof url === 'string' ? allowedArtUrl(url) : null;
+    if (!target) throw new BadRequestException('Invalid artwork url');
+    const width = (() => {
+      const n = Number(w);
+      return Number.isFinite(n) && n > 0 ? Math.min(1600, Math.max(32, Math.round(n))) : 400;
+    })();
+
+    const cacheKey = `${target.href}|w=${width}`;
+    let buf = artCacheGet(cacheKey);
+    if (!buf) {
+      const up = await fetch(target.href, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(6000),
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          accept: 'image/*,*/*;q=0.8',
+        },
+      }).catch(() => null);
+      if (!up || !up.ok) throw new BadRequestException('Artwork fetch failed');
+      // Redirects can leave the allowlist — re-check where we actually landed.
+      if (!allowedArtUrl(up.url || target.href)) throw new BadRequestException('Artwork url redirected off-allowlist');
+
+      const raw = Buffer.from(await up.arrayBuffer());
+      if (raw.length === 0 || raw.length > ART_MAX_BYTES) throw new BadRequestException('Artwork size out of range');
+
+      let out: Buffer;
+      try {
+        out = await sharp(raw, { failOn: 'none' })
+          .rotate()
+          .resize({ width, fit: 'inside', withoutEnlargement: true })
+          .webp({ quality: 78, effort: 4 })
+          .toBuffer();
+      } catch {
+        throw new BadRequestException('Not a decodable image');
+      }
+      buf = out;
+      artCacheSet(cacheKey, out);
+    }
+
+    res.set({
+      'Content-Type': 'image/webp',
+      'Cache-Control': 'public, max-age=86400',
+      'Content-Length': String(buf.length),
+    });
+    res.end(buf);
   }
 
   @Throttle({ default: { limit: 60, ttl: 60000 } })
