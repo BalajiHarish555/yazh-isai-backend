@@ -133,6 +133,22 @@ describe('reels-scorer', () => {
     expect(byId.aaaaaaaaaaa.reasons).toContain('Chill mood');
   });
 
+  it('tags feed-language matches with an "In {lang}" reason for cold accounts', () => {
+    const items = scoreCandidates(
+      [
+        cand({ id: 'aaaaaaaaaaa', title: 'Tamil Song', language: 'tamil', rank: 10 }),
+        cand({ id: 'bbbbbbbbbbb', title: 'Hindi Song', language: 'hindi', rank: 10 }),
+        cand({ id: 'ccccccccccc', title: 'Untagged Song', rank: 10 }),
+      ],
+      ctx({ lang: 'tamil' }),
+    );
+    const byId = Object.fromEntries(items.map((i) => [i.id, i]));
+    expect(byId.aaaaaaaaaaa.reasons).toContain('In Tamil');
+    expect(byId.bbbbbbbbbbb.reasons).not.toContain('In Tamil');
+    expect(byId.ccccccccccc.reasons).not.toContain('In Tamil');
+    expect(byId.aaaaaaaaaaa.score).toBeGreaterThan(byId.bbbbbbbbbbb.score);
+  });
+
   it('applies saved artist preference with a reason', () => {
     const items = scoreCandidates(
       [

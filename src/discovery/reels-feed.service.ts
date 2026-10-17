@@ -181,6 +181,7 @@ export class ReelsFeedService {
       seed,
       mood,
       moodTags,
+      lang,
       prefs,
       taste,
       feedback,
@@ -191,14 +192,22 @@ export class ReelsFeedService {
       limit,
     }).slice(0, limit);
 
+    const personalized =
+      !!userId &&
+      (isUsableTaste(taste) ||
+        (prefs.artists || []).length > 0 ||
+        (prefs.moods || []).length > 0 ||
+        (feedback.likedIds || []).length > 0);
+
     this.logger.log(
-      `Reels feed mood=${mood || 'all'} lang=${lang} pool=${fullPool.length} -> ${items.length} items (user=${userId ? 'yes' : 'no'})`,
+      `Reels feed mood=${mood || 'all'} lang=${lang} pool=${fullPool.length} -> ${items.length} items (user=${userId ? 'yes' : 'no'} personalized=${personalized})`,
     );
 
     return {
       seed,
       mood: mood || null,
       lang,
+      personalized,
       generatedAt: new Date().toISOString(),
       count: items.length,
       items,

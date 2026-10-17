@@ -96,6 +96,9 @@ export interface ReelSessionContext {
 export interface ReelScoringContext {
   seed: string;
   mood?: string | null;
+  /** Requested feed language — matched candidates get an "In {lang}" reason
+   *  even for cold accounts with no saved preferences yet. */
+  lang?: string | null;
   /** Tags that satisfy the requested mood (from MoodEngineService). */
   moodTags?: string[];
   prefs?: ReelPrefs;
@@ -398,6 +401,16 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     const popNorm = Math.max(0, 1 - Math.max(0, candidate.rank) / 50);
     cRelevance += popNorm * 0.45;
     if (popNorm >= 0.6) reasons.push({ text: 'Trending now', w: SCORE_WEIGHTS.relevance * popNorm * 0.45 });
+  }
+  if (
+    candidate.language &&
+    ctx.lang &&
+    candidate.language.trim().toLowerCase() === ctx.lang.trim().toLowerCase()
+  ) {
+    // Feed-language match — honest context chip for cold accounts too
+    // (prefs.languages is empty until the user saves settings server-side).
+    cRelevance += 0.15;
+    reasons.push({ text: `In ${displayCase(candidate.language)}`, w: SCORE_WEIGHTS.relevance * 0.15 });
   }
   if (candidate.language && prefs.languages && prefs.languages.length > 0) {
     const l = candidate.language.trim().toLowerCase();
