@@ -1,13 +1,25 @@
 /* Yazh Isai service worker — app shell + artwork caching.
  * API calls (/api/*) and audio streams always go to network: cached
- * stream URLs expire and cached API data goes stale fast. */
-const SHELL_CACHE = 'yazh-shell-v2';
+ * stream URLs expire and cached API data goes stale fast.
+ * v3: bump forces every client through a clean install/activate cycle so
+ * stale shell caches from earlier deploys are purged (activate deletes
+ * every cache not in the current list).
+ * v4: upgrade activations force-reload open tabs exactly once per sw.js
+ * version, so pages stuck on old bundles (never navigated again) migrate
+ * automatically. First installs skip the reload. */
+const SCRIPT_VERSION = '5';
+const SHELL_CACHE = 'yazh-shell-v4';
 const IMAGE_CACHE = 'yazh-images-v1';
 const AUDIO_CACHE = 'yazh-audio-v1';
 const MAX_IMAGES = 120;
 
+// Upgrade (vs first install): registration.active is the previous worker
+// during an update install, and null on a device's very first install.
+let isUpgrade = false;
+
 // Hashed Vite assets are immutable; index.html + icons are the shell.
 self.addEventListener('install', (event) => {
+  isUpgrade = !!self.registration.active;
   event.waitUntil(
     caches.open(SHELL_CACHE).then((cache) => cache.addAll(['/', '/index.html', '/logo.png'])).then(() => self.skipWaiting()),
   );
@@ -15,16 +27,25 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches
-      .keys()
-      .then((keys) =>
-        Promise.all(
-          keys
-            .filter((k) => k !== SHELL_CACHE && k !== IMAGE_CACHE && k !== AUDIO_CACHE)
-            .map((k) => caches.delete(k)),
-        ),
-      )
-      .then(() => self.clients.claim()),
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(
+        keys
+          .filter((k) => k !== SHELL_CACHE && k !== IMAGE_CACHE && k !== AUDIO_CACHE)
+          .map((k) => caches.delete(k)),
+      );
+      await self.clients.claim();
+      // One reload per sw.js version, upgrade activations only.
+      if (isUpgrade) {
+        const flagUrl = `/yazh-reloaded-${SCRIPT_VERSION}`;
+        const shell = await caches.open(SHELL_CACHE);
+        if (!(await shell.match(flagUrl))) {
+          await shell.put(flagUrl, new Response('1'));
+          const windows = await self.clients.matchAll({ type: 'window' });
+          await Promise.all(windows.map((c) => c.navigate(c.url).catch(() => undefined)));
+        }
+      }
+    })(),
   );
 });
 
