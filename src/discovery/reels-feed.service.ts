@@ -13,6 +13,7 @@ import {
   ReelPrefs,
   normalizeTitle,
   scoreCandidates,
+  ReelFeedItem,
 } from './reels-scorer';
 
 /**
@@ -138,6 +139,18 @@ export class ReelsFeedService {
     const seed = sanitizeSeed(opts?.seed);
     const userId = typeof opts?.userId === 'string' ? opts.userId : '';
 
+    const cacheKey = `reels_feed_${userId || 'anon'}_${mood}_${lang}_${seed}_${limit}`;
+    const cached = await this.cache.get<{
+      seed: string;
+      mood: string | null;
+      lang: string;
+      personalized: boolean;
+      generatedAt: string;
+      count: number;
+      items: ReelFeedItem[];
+    }>(cacheKey).catch(() => null);
+    if (cached) return cached;
+
     let prefs: ReelPrefs = {};
     let feedback: ReelFeedback = {};
     let taste = null;
@@ -203,7 +216,7 @@ export class ReelsFeedService {
       `Reels feed mood=${mood || 'all'} lang=${lang} pool=${fullPool.length} -> ${items.length} items (user=${userId ? 'yes' : 'no'} personalized=${personalized})`,
     );
 
-    return {
+    const result = {
       seed,
       mood: mood || null,
       lang,
@@ -212,6 +225,8 @@ export class ReelsFeedService {
       count: items.length,
       items,
     };
+    await this.cache.set(cacheKey, result, 30).catch(() => undefined);
+    return result;
   }
 
   /**
@@ -228,6 +243,16 @@ export class ReelsFeedService {
       : 18;
     const seed = sanitizeSeed(opts?.seed);
     const userId = typeof opts?.userId === 'string' ? opts.userId : '';
+
+    const cacheKey = `reels_foryou_${userId || 'anon'}_${seed}_${limit}`;
+    const cached = await this.cache.get<{
+      seed: string;
+      generatedAt: string;
+      personalized: boolean;
+      count: number;
+      items: ReelFeedItem[];
+    }>(cacheKey).catch(() => null);
+    if (cached) return cached;
 
     const pool = await this.getForYouCandidates(userId, limit);
 
@@ -286,13 +311,15 @@ export class ReelsFeedService {
       `For You seed=${seed} pool=${pool.length} -> ${items.length} items (personalized=${personalized})`,
     );
 
-    return {
+    const result = {
       seed,
       generatedAt: new Date().toISOString(),
       personalized,
       count: items.length,
       items,
     };
+    await this.cache.set(cacheKey, result, 30).catch(() => undefined);
+    return result;
   }
 
   /**
