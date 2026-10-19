@@ -55,13 +55,14 @@ export class YouTubeMusicService implements OnModuleInit {
      try {
        await youtubedl('https://www.youtube.com/watch?v=aqz-KE-bpKQ', {
          getUrl: true,
-         // Use a representative format for warming up
-         format: 'bestaudio[acodec*=opus][abr>=192]/bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
+         format: 'bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
+         formatSort: ['abr', 'codec'],
          noCheckCertificates: true,
          noWarnings: true,
          noPlaylist: true,
          socketTimeout: 25,
          retries: 1,
+         extractorArgs: 'youtube:player_client=android,web',
        });
        this.logger.log('yt-dlp warmed up with quality formats');
      } catch (error: any) {
@@ -105,20 +106,23 @@ export class YouTubeMusicService implements OnModuleInit {
        // Primary path: youtube-dl-exec (yt-dlp) resolves the real bestaudio
        // URL reliably.
        const resolveViaYtDlp = async () => {
-         const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-           getUrl: true,
-           // Opus first (better quality-per-bit), then AAC. YouTube audio
-           // tops out ~256kbps so the high-abr filters are cheap no-ops.
-           format: 'bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
-           noCheckCertificates: true,
-           noWarnings: true,
-           noPlaylist: true,
-           socketTimeout: 10,
-           retries: 2,
-           // Datacenter IPs get throttled/blocked on the web player client;
-           // the Android client is far less restricted there.
-           extractorArgs: 'youtube:player_client=android',
-         });
+       const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+         getUrl: true,
+         // Prefer highest bitrate available: Opus (better quality-per-bit) first,
+         // then AAC. Sort by abr descending so yt-dlp picks the top rung even
+         // when multiple formats satisfy a filter. YouTube caps ~256kbps on
+         // the free tiers; premium/Android client can expose ~320kbps+.
+         format: 'bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
+         formatSort: ['abr', 'codec'],
+         noCheckCertificates: true,
+         noWarnings: true,
+         noPlaylist: true,
+         socketTimeout: 10,
+         retries: 2,
+         // Android + web clients expose the widest (and highest-bitrate) set
+         // of audio formats on datacenter IPs.
+         extractorArgs: 'youtube:player_client=android,web',
+       });
             const resultUrl = typeof url === 'string' ? url.trim() : null;
             if (resultUrl) {
               // youtube-dl -g returns only the URL, so codec is inferred from the
