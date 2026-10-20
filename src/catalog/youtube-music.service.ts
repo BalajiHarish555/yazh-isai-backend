@@ -110,20 +110,21 @@ export class YouTubeMusicService implements OnModuleInit {
        const resolveViaYtDlp = async () => {
        const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
          dumpSingleJson: true,
-         // Prefer highest bitrate available: Opus (better quality-per-bit) first,
-         // then AAC. Sort by abr descending so yt-dlp picks the top rung even
-         // when multiple formats satisfy a filter. YouTube caps ~256kbps on
-         // the free tiers; premium/Android client can expose ~320kbps+.
-         format: 'bestaudio[acodec*=opus]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
+         // Prefer Opus ≥160kbps (better quality-per-bit than AAC), then any
+         // Opus, then AAC. abr>=160 first so a low-bitrate Opus never beats
+         // a higher-bitrate AAC. Sort by abr descending as tiebreaker.
+         // YouTube caps ~256kbps on free tiers; tv/android clients can
+         // expose higher rungs than web alone.
+         format: 'bestaudio[acodec*=opus][abr>=160]/bestaudio[acodec*=opus]/bestaudio[acodec*=aac][abr>=128]/bestaudio[acodec*=aac]/bestaudio/bestaudio*',
          formatSort: ['abr', 'codec'],
          noCheckCertificates: true,
          noWarnings: true,
          noPlaylist: true,
          socketTimeout: 10,
          retries: 2,
-         // Android + web clients expose the widest (and highest-bitrate) set
-         // of audio formats on datacenter IPs.
-         extractorArgs: 'youtube:player_client=android,web',
+         // android + web + tv: the tv client in particular exposes higher-
+         // bitrate audio formats on datacenter IPs than web alone.
+         extractorArgs: 'youtube:player_client=android,web,tv',
        });
             // info may be a parsed object (youtube-dl-exec default) or a JSON string
             let meta: any = null;

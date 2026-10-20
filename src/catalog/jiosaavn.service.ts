@@ -131,6 +131,70 @@ export class JioSaavnService {
     }
   }
 
+  /**
+   * Rewrite the decrypted `_<n>.mp4` CDN URL to a target bitrate tier.
+   * Matches ANY tier suffix (not just `_96.mp4`) so URLs that arrive on
+   * 48/96 still upgrade correctly; returns null when no tier pattern exists.
+   */
+  private tierUrl(raw: string, bitrate: number): string | null {
+    if (!raw || !/_\d+\.mp4\b/i.test(raw)) return null;
+    return raw.replace(/_\d+\.mp4\b/i, `_${bitrate}.mp4`);
+  }
+
+  /**
+   * Pick the best VERIFIABLE bitrate tier for a decrypted CDN URL.
+   *
+   * The old ladder hard-gated 320 behind `more['320kbps']==='true'`, but the
+   * flag is unreliable on older catalog entries whose 320 file exists — a
+   * large share of plays silently dropped to 160. Now:
+   *  - flag says 320  → trust it, verify 320 sequentially (fast path)
+   *  - flag missing   → verify 320 and 160 IN PARALLEL and prefer 320;
+   *                     verification (HEAD/ranged-GET) is the source of truth
+   *  - saver          → 160 only, as before
+   */
+  private async resolveTieredStream(
+    raw: string,
+    quality: 'best' | 'saver',
+    more: any,
+    title: string,
+    artists: string,
+  ): Promise<SaavnStreamDetails | null> {
+    const build = (streamUrl: string, bitrate: number): SaavnStreamDetails => ({
+      streamUrl,
+      bitrate,
+      codec: 'AAC',
+      mimeType: 'audio/mp4; codecs="mp4a.40.2"',
+      qualityLabel: bitrate === 320 ? '320kbps AAC (High)' : '160kbps AAC (Medium)',
+      quality: bitrate === 320 ? 'high' : 'medium',
+      isLossless: false,
+      source: 'JioSaavn',
+      title,
+      artists,
+    });
+    const url160 = this.tierUrl(raw, 160);
+    if (quality === 'saver') {
+      if (!url160 || !(await this.verifyStream(url160).catch(() => false))) return null;
+      return build(url160, 160);
+    }
+    const url320 = this.tierUrl(raw, 320);
+    const flag320 = more?.['320kbps'] === 'true';
+    if (url320 && url160 && !flag320) {
+      // Flag missing/unreliable — race both tiers, prefer 320.
+      const [ok320, ok160] = await Promise.all([
+        this.verifyStream(url320).catch(() => false),
+        this.verifyStream(url160).catch(() => false),
+      ]);
+      if (ok320) return build(url320, 320);
+      if (ok160) return build(url160, 160);
+      return null;
+    }
+    if (url320 && (flag320 || !url160)) {
+      if (await this.verifyStream(url320).catch(() => false)) return build(url320, 320);
+    }
+    if (url160 && (await this.verifyStream(url160).catch(() => false))) return build(url160, 160);
+    return null;
+  }
+
   private scoreCandidate(
     item: any,
     wantTitle: string,
@@ -203,15 +267,8 @@ export class JioSaavnService {
       return cached;
     }
 
-    // Suffixes in descending quality order; 'saver' starts at 160.
-    const tiers =
-      quality === 'saver'
-        ? [{ suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const }]
-        : [
-            { suffix: '_320.mp4', bitrate: 320, label: '320kbps AAC (High)', q: 'high' as const },
-            { suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const },
-          ];
-
+    // Tier selection (320 → 160, or 160-only under 'saver') happens in
+    // resolveTieredStream — verification decides, not the metadata flag.
     const queries = primary ? [`${cleanTitle} ${primary}`, cleanTitle] : [cleanTitle];
     for (const q of queries.slice(0, 2)) {
       const data = await this.fetchJson(
@@ -235,30 +292,17 @@ export class JioSaavnService {
         const raw = this.decryptMediaUrl(encrypted);
         if (!raw) continue;
 
-        for (const tier of tiers) {
-          // Only 320 is gated on the 320kbps flag; 160 is always constructible.
-          if (tier.suffix === '_320.mp4' && more['320kbps'] !== 'true') continue;
-          const url: string = raw.replace('_96.mp4', tier.suffix);
-          if (url === raw || !url.includes(tier.suffix)) continue;
-          if (!(await this.verifyStream(url))) {
-            this.logger.log(`Saavn ${tier.bitrate} URL failed verification for: ${item?.title}`);
-            continue;
-          }
-          const details: SaavnStreamDetails = {
-            streamUrl: url,
-            bitrate: tier.bitrate,
-            codec: 'AAC',
-            mimeType: 'audio/mp4; codecs="mp4a.40.2"',
-            qualityLabel: tier.label,
-            quality: tier.q,
-            isLossless: false,
-            source: 'JioSaavn',
-            title: item?.title || rawTitle,
-            artists: item?.subtitle || artist,
-          };
+        const details = await this.resolveTieredStream(
+          raw,
+          quality,
+          more,
+          item?.title || rawTitle,
+          item?.subtitle || artist,
+        );
+        if (details) {
           await this.cacheService.set(cacheKey, details, 21600);
           this.logger.log(
-            `Saavn ${tier.bitrate}kbps match (score ${score}): ${item?.title}`,
+            `Saavn ${details.bitrate}kbps match (score ${score}): ${item?.title}`,
           );
           return details;
         }
@@ -310,36 +354,16 @@ export class JioSaavnService {
       return null;
     }
 
-    const tiers =
-      quality === 'saver'
-        ? [{ suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const }]
-        : [
-            { suffix: '_320.mp4', bitrate: 320, label: '320kbps AAC (High)', q: 'high' as const },
-            { suffix: '_160.mp4', bitrate: 160, label: '160kbps AAC (Medium)', q: 'medium' as const },
-          ];
-
-    for (const tier of tiers) {
-      if (tier.suffix === '_320.mp4' && more['320kbps'] !== 'true') continue;
-      const url: string = raw.replace('_96.mp4', tier.suffix);
-      if (url === raw || !url.includes(tier.suffix)) continue;
-      if (!(await this.verifyStream(url))) {
-        this.logger.log(`Saavn ID ${tier.bitrate} URL failed verification for: ${cleanId}`);
-        continue;
-      }
-      const details: SaavnStreamDetails = {
-        streamUrl: url,
-        bitrate: tier.bitrate,
-        codec: 'AAC',
-        mimeType: 'audio/mp4; codecs="mp4a.40.2"',
-        qualityLabel: tier.label,
-        quality: tier.q,
-        isLossless: false,
-        source: 'JioSaavn',
-        title: item?.title || '',
-        artists: item?.subtitle || '',
-      };
+    const details = await this.resolveTieredStream(
+      raw,
+      quality,
+      more,
+      item?.title || '',
+      item?.subtitle || '',
+    );
+    if (details) {
       await this.cacheService.set(cacheKey, details, 21600);
-      this.logger.log(`Saavn ID ${tier.bitrate}kbps resolved: ${cleanId}`);
+      this.logger.log(`Saavn ID ${details.bitrate}kbps resolved: ${cleanId}`);
       return details;
     }
 

@@ -44,4 +44,18 @@ describe('JioSaavnService (pure logic, no network)', () => {
     expect(tokens).toContain('vijay prakash');
     expect(tokens).toContain('shweta mohan');
   });
+
+  it('rewrites CDN URLs to any bitrate tier (robust to non-96 raws)', () => {
+    const url = (n: number) => (svc as any).tierUrl(VECTOR_PLAIN, n);
+    expect(url(320)).toBe('https://aac.saavncdn.com/525/fe0acac4728484d5c85bfc2e51d8d165_320.mp4');
+    expect(url(160)).toContain('_160.mp4');
+    // Raw URLs on a different base tier still upgrade.
+    const raw48 = 'https://aac.saavncdn.com/abc/xyz_48.mp4';
+    expect((svc as any).tierUrl(raw48, 320)).toContain('_320.mp4');
+    // Query-string suffixes survive the rewrite.
+    expect((svc as any).tierUrl(VECTOR_PLAIN + '?sig=abc', 320)).toContain('_320.mp4?sig=abc');
+    // No tier pattern → null (caller falls through to next source).
+    expect((svc as any).tierUrl('https://x/no-tier.mp4', 320)).toBeNull();
+    expect((svc as any).tierUrl('', 320)).toBeNull();
+  });
 });
