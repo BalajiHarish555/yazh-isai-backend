@@ -7,8 +7,8 @@
  * v4: upgrade activations force-reload open tabs exactly once per sw.js
  * version, so pages stuck on old bundles (never navigated again) migrate
  * automatically. First installs skip the reload. */
-const SCRIPT_VERSION = '5';
-const SHELL_CACHE = 'yazh-shell-v4';
+const SCRIPT_VERSION = '6';
+const SHELL_CACHE = 'yazh-shell-v5';
 const IMAGE_CACHE = 'yazh-images-v1';
 const AUDIO_CACHE = 'yazh-audio-v1';
 const MAX_IMAGES = 120;
