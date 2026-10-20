@@ -356,6 +356,31 @@ export class TracksController {
 
     if (isSaavnId(id)) {
       const q = quality === 'saver' ? 'saver' : 'best';
+      // Lossless-by-title lane: saavn catalog ids never reach the YouTube-ID
+      // FLAC path, so try Deezer/Tidal FLAC here before settling for AAC.
+      // Hard 6s ceiling — a slow match must not delay lossy fallback.
+      if (q === 'best' && title && title.length >= 3) {
+        const flac = await Promise.race([
+          this.youtubeMusicService.resolveLosslessByTitle(title, artist).catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 6000)),
+        ]);
+        if (flac?.streamUrl) {
+          // Deezer/Tidal streams are relative decrypting-proxy paths —
+          // absolutize exactly like the YouTube-ID branch does.
+          let flacStreamUrl = flac.streamUrl;
+          if (typeof flacStreamUrl === 'string' && flacStreamUrl.startsWith('/')) {
+            flacStreamUrl = `${proto}://${host}${flacStreamUrl}`;
+          }
+          return {
+            ...flac,
+            streamUrl: flacStreamUrl,
+            // Keep the Saavn proxy as the client-side fallback hop: if the
+            // FLAC stream ever errors, playback degrades to Saavn AAC
+            // instead of going silent.
+            proxyUrl,
+          };
+        }
+      }
       const details = await this.jioSaavnService.getStreamBySongId(id, q).catch(() => null);
       if (!details) {
         return {

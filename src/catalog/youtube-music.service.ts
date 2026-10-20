@@ -104,10 +104,12 @@ export class YouTubeMusicService implements OnModuleInit {
 
     try {
        // Primary path: youtube-dl-exec (yt-dlp) resolves the real bestaudio
-       // URL reliably.
+       // URL reliably. dumpSingleJson (instead of getUrl) returns the full
+       // format metadata INCLUDING the measured bitrate, so quality labels
+       // reflect reality instead of a hardcoded guess.
        const resolveViaYtDlp = async () => {
-       const url = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
-         getUrl: true,
+       const info = await youtubedl(`https://www.youtube.com/watch?v=${videoId}`, {
+         dumpSingleJson: true,
          // Prefer highest bitrate available: Opus (better quality-per-bit) first,
          // then AAC. Sort by abr descending so yt-dlp picks the top rung even
          // when multiple formats satisfy a filter. YouTube caps ~256kbps on
@@ -123,31 +125,29 @@ export class YouTubeMusicService implements OnModuleInit {
          // of audio formats on datacenter IPs.
          extractorArgs: 'youtube:player_client=android,web',
        });
-            const resultUrl = typeof url === 'string' ? url.trim() : null;
+            // info may be a parsed object (youtube-dl-exec default) or a JSON string
+            let meta: any = null;
+            if (typeof info === 'string') {
+              try { meta = JSON.parse(info); } catch { meta = null; }
+            } else if (info && typeof info === 'object') {
+              meta = info;
+            }
+            const resultUrl = typeof meta?.url === 'string' ? meta.url.trim() : null;
             if (resultUrl) {
-              // youtube-dl -g returns only the URL, so codec is inferred from the
-              // URL signature; bitrates are conservative estimates based on requested format
-              const isWebm = resultUrl.includes('mime=audio%2Fwebm') || resultUrl.includes('audio/webm');
-              
-              // Improved bitrate estimation based on requested format priority
-              let estimatedBitrate = 128; // Default fallback
-              if (isWebm) {
-                // Opus formats we requested in order: >=512kbps, >=320kbps, then any Opus
-                // So if we got Opus, it could be VBR or high bitrate
-                estimatedBitrate = 320; // Conservative estimate for Opus (could be higher)
-              } else {
-                // AAC formats we requested in order: >=512kbps, >=320kbps, then any AAC
-                // So if we got AAC, it's at least 320kbps
-                estimatedBitrate = 320; // Minimum for requested AAC formats
-              }
-              
+              // Real bitrate from yt-dlp's format metadata (abr = audio bitrate).
+              // Fall back to conservative estimates when abr is missing.
+              const abr = Number(meta.abr || meta.tbr || 0);
+              const estimatedBitrate = abr > 0 ? Math.round(abr) : 128;
+              const isWebm = resultUrl.includes('mime=audio%2Fwebm') || resultUrl.includes('audio/webm') ||
+                meta.ext === 'webm' || (meta.acodec || '').includes('opus');
+              const codec = isWebm ? 'Opus' : 'AAC';
               return {
                 streamUrl: resultUrl,
                 bitrate: estimatedBitrate,
-                codec: isWebm ? 'Opus' : 'AAC',
+                codec,
                 mimeType: isWebm ? 'audio/webm; codecs="opus"' : 'audio/mp4; codecs="mp4a.40.2"',
-                qualityLabel: isWebm ? 'Opus (~' + estimatedBitrate + 'kbps+)' : 'AAC (~' + estimatedBitrate + 'kbps+)',
-                quality: (estimatedBitrate >= 320 ? 'high' : estimatedBitrate >= 192 ? 'medium' : 'low') as 'high' | 'medium' | 'low',
+                qualityLabel: `${codec} (${estimatedBitrate}kbps)`,
+                quality: (estimatedBitrate >= 256 ? 'high' : estimatedBitrate >= 160 ? 'medium' : 'low') as 'high' | 'medium' | 'low',
                 isLossless: false,
                 source: 'YouTube Music',
                 resolvedQuality: (saver ? 'saver' : 'best') as 'best' | 'saver',
@@ -166,53 +166,35 @@ export class YouTubeMusicService implements OnModuleInit {
         });
       };
 
-     // Lossless FLAC lane: Prioritize lossless sources first for best quality
-        // Check Deezer first (primary ARL, then external fallback — both handled inside DeezerService.getBestFlacStream),
-        // then Tidal (requires a user OAuth token; client credentials alone are metadata-only).
-        // Only for 'best' requests; failures fall through to Saavn/YouTube below so nothing regresses.
+     // Lossless FLAC lane: Prioritize lossless sources first for best quality.
+        // Deezer and Tidal race in parallel (was sequential — a slow miss on
+        // the first doubled every lossless attempt's latency); Deezer wins
+        // ties. Only for 'best' requests; failures fall through to
+        // Saavn/YouTube below so nothing regresses.
         if (title && !saver) {
-          // Check Deezer for lossless first
-          const deezerFlac = await this.deezerService
-            .getBestFlacStream(title, artist || '')
-            .catch(() => null);
-          if (deezerFlac?.streamUrl) {
+          const [deezerFlac, tidalFlac] = await Promise.allSettled([
+            this.deezerService.getBestFlacStream(title, artist || ''),
+            this.tidalService.getBestFlacStream(title, artist || ''),
+          ]).then(([dz, td]) => [
+            dz.status === 'fulfilled' ? dz.value : null,
+            td.status === 'fulfilled' ? td.value : null,
+          ] as const);
+          const flac = deezerFlac || tidalFlac;
+          if (flac?.streamUrl) {
             const details = {
-              streamUrl: deezerFlac.streamUrl,
-              bitrate: deezerFlac.bitrate,
-              codec: deezerFlac.codec,
-              mimeType: deezerFlac.mimeType,
-              qualityLabel: deezerFlac.qualityLabel,
-              quality: deezerFlac.quality,
+              streamUrl: flac.streamUrl,
+              bitrate: flac.bitrate,
+              codec: flac.codec,
+              mimeType: flac.mimeType,
+              qualityLabel: flac.qualityLabel,
+              quality: flac.quality,
               isLossless: true,
-              source: deezerFlac.source,
+              source: flac.source,
               resolvedQuality: 'best' as const,
             };
             await this.cacheService.set(cacheKey, details, 21600);
             this.logger.log(
-              `Deezer FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
-            );
-            return details;
-          }
-
-          // Check Tidal for lossless second
-          const tidalFlac = await this.tidalService
-            .getBestFlacStream(title, artist || '')
-            .catch(() => null);
-          if (tidalFlac?.streamUrl) {
-            const details = {
-              streamUrl: tidalFlac.streamUrl,
-              bitrate: tidalFlac.bitrate,
-              codec: tidalFlac.codec,
-              mimeType: tidalFlac.mimeType,
-              qualityLabel: tidalFlac.qualityLabel,
-              quality: tidalFlac.quality,
-              isLossless: true,
-              source: tidalFlac.source,
-              resolvedQuality: 'best' as const,
-            };
-            await this.cacheService.set(cacheKey, details, 21600);
-            this.logger.log(
-              `Tidal FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
+              `${flac.source} FLAC authoritative for ${videoId} in ${Date.now() - startTime}ms`,
             );
             return details;
           }
@@ -281,6 +263,44 @@ export class YouTubeMusicService implements OnModuleInit {
   ): Promise<string | null> {
     const details = await this.getAudioStreamDetails(videoId, title, artist, quality);
     return details?.streamUrl || null;
+  }
+
+  /**
+   * Lossless-by-title lane for catalog ids that never reach the YouTube-ID
+   * FLAC path (e.g. saavn-* ids, which otherwise settle for 160/320 AAC).
+   * Deezer and Tidal race in parallel; the first FLAC hit wins and is
+   * cached 6h. Callers fall back to their lossy source on null.
+   */
+  async resolveLosslessByTitle(title?: string, artist?: string) {
+    const t = (title || '').trim();
+    if (t.length < 3) return null;
+    const a = (artist || '').trim();
+    const cacheKey = `flac_t_${Buffer.from(`${t}|${a}`.toLowerCase()).toString('base64url').slice(0, 24)}`;
+    const cached = await this.cacheService.get<any>(cacheKey).catch(() => null);
+    if (cached?.streamUrl) return cached;
+
+    const [dz, td] = await Promise.allSettled([
+      this.deezerService.getBestFlacStream(t, a),
+      this.tidalService.getBestFlacStream(t, a),
+    ]);
+    const hit =
+      (dz.status === 'fulfilled' ? dz.value : null) ||
+      (td.status === 'fulfilled' ? td.value : null);
+    if (!hit?.streamUrl) return null;
+    const details = {
+      streamUrl: hit.streamUrl,
+      bitrate: hit.bitrate,
+      codec: hit.codec,
+      mimeType: hit.mimeType,
+      qualityLabel: hit.qualityLabel,
+      quality: hit.quality,
+      isLossless: true,
+      source: hit.source,
+      resolvedQuality: 'best' as const,
+    };
+    await this.cacheService.set(cacheKey, details, 21600).catch(() => undefined);
+    this.logger.log(`Lossless-by-title hit for "${t}" via ${hit.source}`);
+    return details;
   }
 
   private parseDurationLabel(label: string): number | undefined {
