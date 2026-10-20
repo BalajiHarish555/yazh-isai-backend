@@ -25,6 +25,7 @@ export class DiscoveryController {
   // Reels feed: optional auth — personalized when a token is present,
   // anonymous otherwise (req.user stays unset — never dereferenced blindly).
   // 'reels' is a stable alias of 'feed' so both documented paths resolve.
+  // `cursor` continues a previous page (opaque, server-issued).
   @UseGuards(OptionalJwtAuthGuard)
   @Get(['feed', 'reels'])
   async getFeed(
@@ -33,10 +34,11 @@ export class DiscoveryController {
     @Query('lang') lang?: string,
     @Query('limit') limit?: string,
     @Query('seed') seed?: string,
+    @Query('cursor') cursor?: string,
   ) {
     const userId = req.user?.userId || '';
     const parsedLimit = limit ? parseInt(limit, 10) : undefined;
-    return this.reels.getFeed({ mood, lang, limit: parsedLimit, seed, userId });
+    return this.reels.getFeed({ mood, lang, limit: parsedLimit, seed, userId, cursor });
   }
 
   // Personalised "For You" home feed — taste-ranked, discovery-mixed.
@@ -58,6 +60,25 @@ export class DiscoveryController {
   async postEvents(@Req() req: any, @Body() body: any) {
     const userId = req.user?.userId || '';
     return this.reels.recordEvents(userId, body);
+  }
+
+  // Recommendation reset — clears reel feedback, search intent and the
+  // live session for this user (explicit likes stay: they are the user's
+  // collection, not algorithm state).
+  @UseGuards(JwtAuthGuard)
+  @Post('reset')
+  async resetRecommendations(@Req() req: any) {
+    const userId = req.user?.userId || '';
+    return this.reels.resetRecommendations(userId);
+  }
+
+  // Feed outcome metrics — meaningful listening, completion, skips,
+  // likes, repetition, artist diversity, discovery uptake.
+  @UseGuards(JwtAuthGuard)
+  @Get('metrics')
+  async getMetrics(@Req() req: any, @Query('days') days?: string) {
+    const userId = req.user?.userId || '';
+    return this.reels.getMetrics(userId, days ? parseInt(days, 10) : 30);
   }
 
   @UseGuards(JwtAuthGuard)

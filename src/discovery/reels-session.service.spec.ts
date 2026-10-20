@@ -69,6 +69,20 @@ describe('ReelSessionService', () => {
     expect(s.context(user)).toBeNull(); //31min → expired
   });
 
+  it('clear() drops a live session so the next record starts fresh', () => {
+    const s = new ReelSessionService();
+    s.record(user, { eventType: 'complete', title: 'Song A', artist: 'A', discovery: true });
+    expect(s.context(user)!.session.playedTitles).toEqual(['song a']);
+    s.clear(user);
+    expect(s.context(user)).toBeNull();
+    // Fresh appetite after reset
+    s.record(user, { eventType: 'play', title: 'Song B', artist: 'B' });
+    expect(s.context(user)!.appetite).toBeCloseTo(0.15, 5);
+    // clear('') is a no-op, not a crash
+    s.clear('');
+    expect(s.context(user)).not.toBeNull();
+  });
+
   it('keeps the newest MAX_EVENTS per user', () => {
     const s = new ReelSessionService();
     for (let i = 0; i < 60; i++) {

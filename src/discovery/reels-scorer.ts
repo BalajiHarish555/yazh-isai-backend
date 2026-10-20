@@ -1,4 +1,5 @@
 import { TasteProfile, scoreTrack, isUsableTaste } from './taste-profile.service';
+import { getReelsConfig, DEFAULT_REELS_CONFIG, ReelsScoringConfig } from './reels-config';
 
 /**
  * Deterministic Reels/For-You ranking — transparent rules, no ML.
@@ -114,6 +115,8 @@ export interface ReelScoringContext {
   appetite?: number;
   /** Composition plan length — callers pass the feed limit. */
   limit?: number;
+  /** Optional config override (tests / per-request tuning); defaults to env. */
+  config?: ReelsScoringConfig;
 }
 
 export interface ReelFeedItem {
@@ -181,20 +184,15 @@ const displayCase = (s: string) => s.replace(/\b\w/g, (c) => c.toUpperCase());
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const round2 = (v: number) => Math.round(v * 100) / 100;
 
-/** Component weights — the30/25/15/15/15 split, scaled to points. */
-export const SCORE_WEIGHTS = {
-  taste: 3, // 30%
-  behavior: 2.5, // 25%
-  context: 1.5, // 15%
-  relevance: 1.5, // 15%
-  discovery: 1.5, // 15%
-} as const;
+/** Component weights — the30/25/15/15/15 split, scaled to points.
+ *  Defaults; live values come from getReelsConfig() (env-overridable). */
+export const SCORE_WEIGHTS = DEFAULT_REELS_CONFIG.weights;
 
 /** Base bucket mix:60% familiar,25% similar,15% exploration. */
-export const BASE_BUCKETS = { familiar: 0.6, similar: 0.25, discovery: 0.15 } as const;
-export const APPETITE_DEFAULT = 0.15;
-export const APPETITE_MIN = 0.1;
-export const APPETITE_MAX = 0.3;
+export const BASE_BUCKETS = DEFAULT_REELS_CONFIG.buckets;
+export const APPETITE_DEFAULT = DEFAULT_REELS_CONFIG.appetite.default;
+export const APPETITE_MIN = DEFAULT_REELS_CONFIG.appetite.min;
+export const APPETITE_MAX = DEFAULT_REELS_CONFIG.appetite.max;
 
 interface Weighted {
   text: string;
@@ -241,13 +239,15 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
 }): Scored | null {
   const nTitle = normalizeTitle(candidate.title);
   const reasons: Weighted[] = [];
+  const cfg = ctx.config ?? getReelsConfig();
+  const W = cfg.weights;
 
   // ---- Component: personal taste match (30%) --------------------------
   let cTaste = 0;
   const liked = sets.likedIds.has(candidate.id) || sets.likedTitles.has(nTitle);
   if (liked) {
     cTaste += 0.9;
-    reasons.push({ text: 'You liked this', w: SCORE_WEIGHTS.taste * 0.9 });
+    reasons.push({ text: 'You liked this', w: W.taste * 0.9 });
   }
 
   const tokens = artistTokens(candidate);
@@ -267,7 +267,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     });
     const tNorm = clamp(tRaw / 4, -1, 1);
     cTaste += tNorm;
-    for (const text of tReasons) reasons.push({ text, w: SCORE_WEIGHTS.taste * tNorm });
+    for (const text of tReasons) reasons.push({ text, w: W.taste * tNorm });
     tasteSingerAny = taste.singers.some((s) => s.affinity > 0 && tokens.includes(s.name));
     tasteMatched = tNorm > 0;
   }
@@ -283,7 +283,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     if (hit) {
       prefArtistHit = true;
       cTaste += 0.4;
-      reasons.push({ text: `More from ${displayCase(hit)}`, w: SCORE_WEIGHTS.taste * 0.4 });
+      reasons.push({ text: `More from ${displayCase(hit)}`, w: W.taste * 0.4 });
     }
   }
   if (candidate.genre && prefs.genres && prefs.genres.length > 0) {
@@ -291,7 +291,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     if (prefs.genres.some((x) => x.trim().toLowerCase() === g)) {
       prefGenreHit = true;
       cTaste += 0.2;
-      reasons.push({ text: `${displayCase(g)} vibes`, w: SCORE_WEIGHTS.taste * 0.2 });
+      reasons.push({ text: `${displayCase(g)} vibes`, w: W.taste * 0.2 });
     }
   }
   if (candidate.language && prefs.languages && prefs.languages.length > 0) {
@@ -299,7 +299,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     if (prefs.languages.some((x) => x.trim().toLowerCase() === l)) {
       prefLangHit = true;
       cTaste += 0.15;
-      reasons.push({ text: `In ${displayCase(l)}`, w: SCORE_WEIGHTS.taste * 0.15 });
+      reasons.push({ text: `In ${displayCase(l)}`, w: W.taste * 0.15 });
     }
   }
 
@@ -331,7 +331,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     const neg = Math.min(1, tb.skips * 0.5);
     if (tb.completions + tb.replays > 0) {
       behaviorTitleHit = true;
-      reasons.push({ text: 'You listened to this before', w: SCORE_WEIGHTS.behavior * 0.25 });
+      reasons.push({ text: 'You listened to this before', w: W.behavior * 0.25 });
     }
     cBehavior += pos - neg;
   }
@@ -362,7 +362,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     const allowed = new Set((ctx.moodTags || []).map((t) => t.toLowerCase()));
     if (tags.includes(moodId) || tags.some((t) => allowed.has(t))) {
       cContext = 0.9;
-      reasons.push({ text: `${displayCase(moodId)} mood`, w: SCORE_WEIGHTS.context * 0.9 });
+      reasons.push({ text: `${displayCase(moodId)} mood`, w: W.context * 0.9 });
     }
   }
   if (moodId && (session?.moodCompletions?.[moodId] || 0) >= 2) {
@@ -376,7 +376,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
       prefMoodHit = true;
       if (cContext < 0.5) {
         cContext = 0.5;
-        reasons.push({ text: `Your ${displayCase(hit)} picks`, w: SCORE_WEIGHTS.context * 0.5 });
+        reasons.push({ text: `Your ${displayCase(hit)} picks`, w: W.context * 0.5 });
       }
     }
   }
@@ -389,7 +389,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     const closeness = Math.max(0, 1 - Math.abs(candidate.energy - prefs.energy));
     if (closeness > 0.6 && closeness > cContext) {
       cContext = closeness;
-      reasons.push({ text: 'Matches your energy', w: SCORE_WEIGHTS.context * closeness });
+      reasons.push({ text: 'Matches your energy', w: W.context * closeness });
     }
   }
   cContext = clamp(cContext, 0, 1);
@@ -400,7 +400,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
   if (typeof candidate.rank === 'number' && Number.isFinite(candidate.rank)) {
     const popNorm = Math.max(0, 1 - Math.max(0, candidate.rank) / 50);
     cRelevance += popNorm * 0.45;
-    if (popNorm >= 0.6) reasons.push({ text: 'Trending now', w: SCORE_WEIGHTS.relevance * popNorm * 0.45 });
+    if (popNorm >= 0.6) reasons.push({ text: 'Trending now', w: W.relevance * popNorm * 0.45 });
   }
   if (
     candidate.language &&
@@ -410,7 +410,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     // Feed-language match — honest context chip for cold accounts too
     // (prefs.languages is empty until the user saves settings server-side).
     cRelevance += 0.15;
-    reasons.push({ text: `In ${displayCase(candidate.language)}`, w: SCORE_WEIGHTS.relevance * 0.15 });
+    reasons.push({ text: `In ${displayCase(candidate.language)}`, w: W.relevance * 0.15 });
   }
   if (candidate.language && prefs.languages && prefs.languages.length > 0) {
     const l = candidate.language.trim().toLowerCase();
@@ -435,7 +435,7 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
         const bonus = Math.min(0.6, hits * 0.3);
         searchHit = true;
         cRelevance += bonus;
-        reasons.push({ text: 'Matches your recent search', w: SCORE_WEIGHTS.relevance * bonus });
+        reasons.push({ text: 'Matches your recent search', w: W.relevance * bonus });
       }
     }
   }
@@ -453,8 +453,8 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
   const sessionPlayed = session?.playedTitles?.some((t) => t === nTitle) ?? false;
   const recentIdHit = ctx.behavior?.recentIds?.includes(candidate.id) ?? false;
   const recentIdx = ctx.behavior?.recentPlays?.findIndex((t) => t === nTitle) ?? -1;
-  if (sessionPlayed || recentIdHit) repeat = -3;
-  else if (recentIdx >= 0) repeat = recentIdx < 8 ? -2.5 : -1;
+  if (sessionPlayed || recentIdHit) repeat = cfg.repeatPenalties.session;
+  else if (recentIdx >= 0) repeat = recentIdx < 8 ? cfg.repeatPenalties.recent : cfg.repeatPenalties.older;
   if (repeat < 0) {
     // Just heard ≠ fresh gem: cap novelty when the repeat penalty fires.
     cDiscovery = Math.min(cDiscovery, 0.5);
@@ -477,11 +477,11 @@ function scoreOne(candidate: ReelCandidate, ctx: ReelScoringContext, sets: {
     tasteMatched || prefLangHit || prefGenreHit || prefMoodHit || searchHit || artistHeard;
 
   const score =
-    SCORE_WEIGHTS.taste * cTaste +
-    SCORE_WEIGHTS.behavior * cBehavior +
-    SCORE_WEIGHTS.context * cContext +
-    SCORE_WEIGHTS.relevance * cRelevance +
-    SCORE_WEIGHTS.discovery * cDiscovery +
+    W.taste * cTaste +
+    W.behavior * cBehavior +
+    W.context * cContext +
+    W.relevance * cRelevance +
+    W.discovery * cDiscovery +
     repeat;
 
   const deduped = dedupeReasons(reasons);
@@ -517,13 +517,19 @@ function classifyBucket(s: Scored): ReelBucket {
  * back of the feed (later songs introduce gems). Exact integer counts via
  * largest-remainder; a short bucket falls back to whichever has stock.
  */
-function composeByBuckets(ranked: Scored[], seed: string, appetite: number, planLen: number): Scored[] {
+function composeByBuckets(
+  ranked: Scored[],
+  seed: string,
+  appetite: number,
+  planLen: number,
+  cfg: ReelsScoringConfig,
+): Scored[] {
   if (ranked.length === 0) return [];
   const n = Math.max(1, Math.min(planLen, ranked.length));
   const raw = {
-    familiar: BASE_BUCKETS.familiar,
-    similar: BASE_BUCKETS.similar,
-    discovery: clamp(appetite, APPETITE_MIN, APPETITE_MAX),
+    familiar: cfg.buckets.familiar,
+    similar: cfg.buckets.similar,
+    discovery: clamp(appetite, cfg.appetite.min, cfg.appetite.max),
   };
   const rawSum = raw.familiar + raw.similar + raw.discovery;
   const target = {
@@ -601,8 +607,6 @@ function composeByBuckets(ranked: Scored[], seed: string, appetite: number, plan
   return out;
 }
 
-const DIVERSITY_CAP = 3;
-
 /**
  * Rank → diversify → classify → compose → package. Deterministic given
  * (candidates, ctx): ties are broken by a hash of `seed + id`, never by
@@ -610,6 +614,7 @@ const DIVERSITY_CAP = 3;
  * artist, overflow preserved so a small pool still fills a feed.
  */
 export function scoreCandidates(candidates: ReelCandidate[], ctx: ReelScoringContext): ReelFeedItem[] {
+  const cfg = ctx.config ?? getReelsConfig();
   const fb = ctx.feedback || {};
   const hiddenIds = new Set(fb.hiddenIds || []);
   const hiddenTitles = new Set((fb.hiddenTitles || []).map(normalizeTitle));
@@ -645,14 +650,14 @@ export function scoreCandidates(candidates: ReelCandidate[], ctx: ReelScoringCon
     return a.candidate.id < b.candidate.id ? -1 : a.candidate.id > b.candidate.id ? 1 : 0;
   });
 
-  // Diversity: max DIVERSITY_CAP per primary artist, greedy in rank order.
+  // Diversity: max cfg.diversityCap per primary artist, greedy in rank order.
   const countsByArtist = new Map<string, number>();
   const pass1: Scored[] = [];
   const overflow: Scored[] = [];
   for (const s of scored) {
     const key = primaryArtist(s.candidate);
     const used = countsByArtist.get(key) || 0;
-    if (used < DIVERSITY_CAP) {
+    if (used < cfg.diversityCap) {
       countsByArtist.set(key, used + 1);
       pass1.push(s);
     } else {
@@ -670,8 +675,9 @@ export function scoreCandidates(candidates: ReelCandidate[], ctx: ReelScoringCon
           ctx.seed,
           typeof ctx.appetite === 'number' && Number.isFinite(ctx.appetite)
             ? ctx.appetite
-            : APPETITE_DEFAULT,
+            : cfg.appetite.default,
           typeof ctx.limit === 'number' && ctx.limit > 0 ? Math.floor(ctx.limit) : ordered.length,
+          cfg,
         );
 
   return composed.map(({ candidate: c, score, reasons, bucket }) => ({

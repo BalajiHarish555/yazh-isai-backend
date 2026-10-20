@@ -39,6 +39,9 @@ function makeService(overrides: {
       createMany: vi.fn().mockResolvedValue({ count: 0 }),
       deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
+    searchIntent: {
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
+    },
     userPreferences: {
       findUnique: vi.fn().mockResolvedValue(null),
       upsert: vi.fn().mockResolvedValue(undefined),
@@ -78,6 +81,7 @@ function makeService(overrides: {
 
   const session = {
     record: vi.fn(),
+    clear: vi.fn(),
     context: vi.fn().mockReturnValue(null),
   };
 
@@ -359,5 +363,135 @@ describe('ReelsFeedService.getForYou', () => {
     const feed = await service.getForYou({ userId: 'user-1', limit: 10, seed: 's' });
     expect(feed.count).toBeGreaterThan(0);
     expect(feed.items.every((i) => i.id.startsWith('saavn-'))).toBe(true);
+  });
+});
+
+describe('ReelsFeedService cursor continuation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('page 1 returns a nextCursor when the page is full; page 2 excludes page 1 ids', async () => {
+    const { service } = makeService();
+    const p1 = await service.getFeed({ seed: 's', limit: 5 });
+    expect(p1.page).toBe(1);
+    expect(p1.items.length).toBe(5);
+    expect(p1.nextCursor).toBeTruthy();
+
+    const p2 = await service.getFeed({ cursor: p1.nextCursor!, limit: 5 });
+    expect(p2.page).toBe(2);
+    const p1Ids = new Set(p1.items.map((i) => i.id));
+    expect(p2.items.some((i) => p1Ids.has(i.id))).toBe(false);
+    expect(p2.items.length).toBeGreaterThan(0);
+  });
+
+  it('terminates when the pool is exhausted (short page ? no cursor)', async () => {
+    const { service } = makeService();
+    const p1 = await service.getFeed({ seed: 's', limit: 5 });
+    const p2 = await service.getFeed({ cursor: p1.nextCursor!, limit: 5 });
+    const p3 = await service.getFeed({ cursor: p2.nextCursor!, limit: 5 });
+    expect(p3.items.length).toBeLessThan(5);
+    expect(p3.nextCursor).toBeNull();
+  });
+
+  it('a cursor owns the request context (query params are ignored while continuing)', async () => {
+    const { service } = makeService();
+    const p1 = await service.getFeed({ mood: 'chill', seed: 'ctx', limit: 5 });
+    const p2 = await service.getFeed({
+      cursor: p1.nextCursor!,
+      mood: 'sad', // mood switch without a new seed — cursor context wins
+      lang: 'malayalam',
+      limit: 5,
+    });
+    expect(p2.mood).toBe('chill');
+    expect(p2.seed).toBe('ctx');
+    expect(p2.lang).toBe('tamil');
+  });
+
+  it('treats a malformed cursor as a fresh feed', async () => {
+    const { service } = makeService();
+    const feed = await service.getFeed({ cursor: 'garbage!!!', seed: 's', limit: 5 });
+    expect(feed.page).toBe(1);
+    expect(feed.items.length).toBe(5);
+  });
+
+  it('no nextCursor when the first page is short', async () => {
+    const { service } = makeService({ trending: [saavnRow(1)] });
+    const feed = await service.getFeed({ seed: 's', limit: 30 });
+    expect(feed.items.length).toBeLessThan(30);
+    expect(feed.nextCursor).toBeNull();
+  });
+});
+
+describe('ReelsFeedService.resetRecommendations', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('clears reel events, search intents and the live session', async () => {
+    const { service, prisma, session } = makeService();
+    prisma.reelEvent.deleteMany.mockResolvedValue({ count: 7 });
+    prisma.searchIntent.deleteMany.mockResolvedValue({ count: 2 });
+
+    const res = await service.resetRecommendations('user-1');
+    expect(res).toEqual({ clearedReelEvents: 7, clearedSearchIntents: 2 });
+    expect(prisma.reelEvent.deleteMany).toHaveBeenCalledWith({ where: { userId: 'user-1' } });
+    expect(prisma.searchIntent.deleteMany).toHaveBeenCalledWith({ where: { userId: 'user-1' } });
+    expect(session.clear).toHaveBeenCalledWith('user-1');
+  });
+
+  it('tolerates a missing search-intent table shape (count 0) but still clears reels', async () => {
+    const { service, prisma, session } = makeService();
+    prisma.reelEvent.deleteMany.mockResolvedValue({ count: 3 });
+    prisma.searchIntent.deleteMany.mockRejectedValue(new Error('relation missing'));
+    const res = await service.resetRecommendations('user-1');
+    expect(res.clearedReelEvents).toBe(3);
+    expect(res.clearedSearchIntents).toBe(0);
+    expect(session.clear).toHaveBeenCalledWith('user-1');
+  });
+
+  it('rejects a missing userId', async () => {
+    const { service } = makeService();
+    await expect(service.resetRecommendations('')).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('ReelsFeedService.getMetrics', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('aggregates reel + history events into outcome metrics', async () => {
+    const { service, prisma } = makeService();
+    prisma.reelEvent.findMany.mockResolvedValue([
+      { eventType: 'play', dwellMs: 12000, artist: 'A', trackId: 't1', discovery: false },
+      { eventType: 'play', dwellMs: 800, artist: 'B', trackId: 't2', discovery: true },
+      { eventType: 'skip', dwellMs: 400, artist: 'C', trackId: 't3', discovery: false },
+      { eventType: 'like', dwellMs: 0, artist: 'A', trackId: 't1', discovery: false },
+    ]);
+    prisma.listeningEvent.findMany.mockResolvedValue([
+      { eventType: 'complete', position: 200, duration: 200, artist: 'A' },
+      { eventType: 'skip', position: 20, duration: 200, artist: 'B' },
+    ]);
+
+    const m = await service.getMetrics('user-1', 14);
+    expect(m.windowDays).toBe(14);
+    expect(m.counts.plays).toBe(2);
+    expect(m.counts.skips).toBe(1);
+    expect(m.counts.likes).toBe(1);
+    expect(m.meaningfulPlays).toBe(1);
+    expect(m.rates.completionRate).toBeCloseTo(0.5, 5);
+    expect(m.rates.discoveryShare).toBeCloseTo(0.25, 5);
+    // Query window bounded
+    const since = prisma.reelEvent.findMany.mock.calls[0][0].where.createdAt.gte;
+    expect(since.getTime()).toBeLessThanOrEqual(Date.now());
+    expect(since.getTime()).toBeGreaterThan(Date.now() - 15 * 86400000);
+  });
+
+  it('clamps windowDays to 1..365 and rejects missing userId', async () => {
+    const { service } = makeService();
+    expect((await service.getMetrics('u', 0)).windowDays).toBe(1);
+    expect((await service.getMetrics('u', 9999)).windowDays).toBe(365);
+    await expect(service.getMetrics('')).rejects.toBeInstanceOf(BadRequestException);
   });
 });

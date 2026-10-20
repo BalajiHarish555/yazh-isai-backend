@@ -99,6 +99,12 @@ export class ReelSessionService {
     }
   }
 
+  /** Drop a user's live session (recommendation reset / logout hygiene). */
+  clear(userId: string): void {
+    if (!userId) return;
+    this.store.delete(userId);
+  }
+
   /** Snapshot for the scorer; null when there is no live session. */
   context(userId: string): { appetite: number; session: ReelSessionContext } | null {
     if (!userId) return null;

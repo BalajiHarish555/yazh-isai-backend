@@ -13,8 +13,11 @@ import {
   ReelPrefs,
   normalizeTitle,
   scoreCandidates,
+  stableHash,
   ReelFeedItem,
 } from './reels-scorer';
+import { decodeFeedCursor, encodeFeedCursor, extendSeen } from './feed-cursor';
+import { computeReelMetrics, ReelMetrics } from './reels-metrics';
 
 /**
  * Reels feed service: gathers provider candidates (Saavn charts, mood- or
@@ -129,17 +132,24 @@ export class ReelsFeedService {
     limit?: number;
     seed?: string;
     userId?: string;
+    /** Opaque continuation cursor from a previous page (context + seen ids). */
+    cursor?: string;
   }) {
     const limitRaw = Number(opts?.limit);
     const limit = Number.isFinite(limitRaw)
       ? Math.max(5, Math.min(30, Math.floor(limitRaw)))
       : 20;
-    const mood = sanitizeToken(opts?.mood);
-    const lang = sanitizeToken(opts?.lang) || 'tamil';
-    const seed = sanitizeSeed(opts?.seed);
+    // A valid cursor owns the request context (continuity); without one the
+    // query params define a fresh feed. Mood switches simply omit the cursor.
+    const cursor = decodeFeedCursor(opts?.cursor);
+    const mood = cursor ? (cursor.mood ?? '') : sanitizeToken(opts?.mood);
+    const lang = cursor ? cursor.lang : sanitizeToken(opts?.lang) || 'tamil';
+    const seed = cursor ? cursor.seed : sanitizeSeed(opts?.seed);
+    const page = cursor ? cursor.page : 1;
+    const seenIds = new Set(cursor?.seen ?? []);
     const userId = typeof opts?.userId === 'string' ? opts.userId : '';
 
-    const cacheKey = `reels_feed_${userId || 'anon'}_${mood}_${lang}_${seed}_${limit}`;
+    const cacheKey = `reels_feed_${userId || 'anon'}_${mood}_${lang}_${seed}_${limit}_p${page}_${seenIds.size ? stableHash([...seenIds].join(',')).toString(36) : '0'}`;
     const cached = await this.cache.get<{
       seed: string;
       mood: string | null;
@@ -147,6 +157,8 @@ export class ReelsFeedService {
       personalized: boolean;
       generatedAt: string;
       count: number;
+      page: number;
+      nextCursor: string | null;
       items: ReelFeedItem[];
     }>(cacheKey).catch(() => null);
     if (cached) return cached;
@@ -185,7 +197,11 @@ export class ReelsFeedService {
     // (and its forced first-two-slots lead). Uncached — a shared cache
     // would leak one user's artist queries into everyone's feed.
     const artistSlice = await this.getTasteArtistCandidates(taste, lang);
-    const fullPool = artistSlice.length > 0 ? [...artistSlice, ...pool] : pool;
+    const mergedPool = artistSlice.length > 0 ? [...artistSlice, ...pool] : pool;
+    // Continuation pages drop everything already delivered in this session.
+    const fullPool = seenIds.size
+      ? mergedPool.filter((c) => !seenIds.has(c.id))
+      : mergedPool;
 
     const sess = userId ? this.session.context(userId) : null;
     const moodTags = mood ? this.moodEngine.getParamsForMood(mood).moods : [];
@@ -216,6 +232,22 @@ export class ReelsFeedService {
       `Reels feed mood=${mood || 'all'} lang=${lang} pool=${fullPool.length} -> ${items.length} items (user=${userId ? 'yes' : 'no'} personalized=${personalized})`,
     );
 
+    // Continuation only when this page came back full — a short page means
+    // the eligible pool is exhausted and another request would loop.
+    const nextCursor =
+      items.length >= limit && items.length > 0
+        ? encodeFeedCursor({
+            seed,
+            mood: mood || null,
+            lang,
+            page: page + 1,
+            seen: extendSeen(
+              [...seenIds],
+              items.map((i) => i.id),
+            ),
+          })
+        : null;
+
     const result = {
       seed,
       mood: mood || null,
@@ -223,6 +255,8 @@ export class ReelsFeedService {
       personalized,
       generatedAt: new Date().toISOString(),
       count: items.length,
+      page,
+      nextCursor,
       items,
     };
     await this.cache.set(cacheKey, result, 30).catch(() => undefined);
@@ -672,6 +706,59 @@ export class ReelsFeedService {
     };
   }
 
+  /**
+   * Recommendation reset — clears the signals that shape the feed for this
+   * user (reel feedback, search intent, live session) so the next request
+   * starts fresh. Explicit library likes / catalog favorites are the user's
+   * own collection, not recommendation state, and are intentionally kept.
+   */
+  async resetRecommendations(
+    userId: string,
+  ): Promise<{ clearedReelEvents: number; clearedSearchIntents: number }> {
+    if (!userId) throw new BadRequestException('userId required');
+    const [reels, intents] = await Promise.all([
+      this.prisma.reelEvent.deleteMany({ where: { userId } }),
+      this.prisma.searchIntent.deleteMany({ where: { userId } }).catch(() => ({ count: 0 })),
+    ]);
+    this.session.clear(userId);
+    // Feed caches are keyed per (user, mood, lang, seed, page) with a 30s
+    // TTL — the pre-reset order self-expires within one cache window.
+    this.logger.log(`Recommendations reset for user (reels=${reels.count}, intents=${intents.count})`);
+    return { clearedReelEvents: reels.count, clearedSearchIntents: intents.count };
+  }
+
+  /**
+   * Outcome metrics for this user's feed session behaviour — the
+   * observability surface: meaningful listening, completion, skips,
+   * likes, repetition, artist diversity, discovery uptake.
+   */
+  async getMetrics(userId: string, windowDays = 30): Promise<ReelMetrics & { windowDays: number }> {
+    if (!userId) throw new BadRequestException('userId required');
+    // Note: `Number(x) || 30` would treat an explicit 0 as "default" — a
+    // caller passing 0 (or a negative) wants the minimum window, not 30.
+    const parsedDays = Number(windowDays);
+    const days = Number.isFinite(parsedDays)
+      ? Math.max(1, Math.min(365, Math.floor(parsedDays)))
+      : 30;
+    const since = new Date(Date.now() - days * 86400000);
+    const [reelEvents, historyEvents] = await Promise.all([
+      this.prisma.reelEvent.findMany({
+        where: { userId, createdAt: { gte: since } },
+        orderBy: { createdAt: 'desc' },
+        take: 1000,
+        select: { eventType: true, dwellMs: true, artist: true, trackId: true, discovery: true },
+      }),
+      this.prisma.listeningEvent.findMany({
+        where: { userId, createdAt: { gte: since } },
+        orderBy: { createdAt: 'desc' },
+        take: 500,
+        select: { eventType: true, position: true, duration: true, artist: true },
+      }),
+    ]);
+    const metrics = computeReelMetrics(reelEvents as any[], historyEvents as any[]);
+    return { ...metrics, windowDays: days };
+  }
+
   async recordEvents(userId: string, body: any): Promise<{ recorded: number; rejected: number }> {
     const raw: any[] = Array.isArray(body?.events)
       ? body.events
@@ -705,6 +792,7 @@ export class ReelsFeedService {
         dwellMs: Number.isFinite(dwell) ? Math.max(0, Math.min(600000, Math.round(dwell))) : 0,
         title: title || null,
         artist: artist || null,
+        discovery: e?.discovery === true,
       });
       // Session layer: appetite + repeat/singer/mood context for the next request.
       this.session.record(userId, {
