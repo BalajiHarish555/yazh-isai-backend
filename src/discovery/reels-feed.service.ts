@@ -127,19 +127,27 @@ export class ReelsFeedService implements OnModuleInit {
   ) {}
 
   /**
-   * Staggered fire-and-forget warm-up. In-memory caches die on every Render
-   * cold start, so the first real user used to pay ~2s of pool builds +
-   * catalog searches. Heating the default tamil feed shortly after boot
-   * moves that cost off the user's first swipe. Never blocks/fails boot.
+   * Staggered fire-and-forget keep-warm. In-memory caches die on every Render
+   * cold start, and the feed page cache TTL is only 30s — a one-shot warm-up
+   * expired before the first real user arrived. Refreshing every 20s (under
+   * the TTL, direct method call — no network) keeps the default tamil feed
+   * perpetually hot while the instance is awake, so the first swipe after any
+   * idle window never pays the ~2s pool-build + catalog-search cost. The
+   * periodic refresh also re-seeds the 300s candidate pool. Never blocks or
+   * fails boot; unref'd so it never holds the process open.
    */
   onModuleInit(): void {
-    const timer = setTimeout(() => {
+    const warm = () => {
       this.getFeed({ lang: 'tamil', limit: 20 })
-        .then((f) => this.logger.log(`Feed warmed up (${f?.items?.length ?? 0} items)`))
+        .then((f) => this.logger.log(`Feed kept warm (${f?.items?.length ?? 0} items)`))
         .catch(() => undefined);
-    }, 6000);
-    const t: any = timer;
-    if (t && typeof t.unref === 'function') t.unref();
+    };
+    const start = setTimeout(warm, 6000);
+    const s: any = start;
+    if (s && typeof s.unref === 'function') s.unref();
+    const interval = setInterval(warm, 20000);
+    const i: any = interval;
+    if (i && typeof i.unref === 'function') i.unref();
   }
 
   async getFeed(opts: {
