@@ -3,6 +3,7 @@ import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
+import compression from 'compression';
 import { getJwtSecret } from './auth/jwt-secret.util';
 
 process.on('unhandledRejection', (reason) => {
@@ -35,6 +36,12 @@ async function bootstrap() {
       crossOriginResourcePolicy: { policy: 'cross-origin' },
     }),
   );
+  // Gzip/deflate every eligible response (static JS/CSS + API JSON).
+  // Without this Render serves the 523KB bundle RAW over a slow free-tier
+  // link (~2.7s measured); gzipped it drops to ~170KB (<1s) and API JSON
+  // shrinks 4-8x. Must be registered before ServeStaticModule routes so it
+  // wraps the static-file responses too. threshold=1024 skips tiny bodies.
+  app.use(compression({ threshold: 1024 }));
 
   const isProduction = process.env.NODE_ENV === 'production';
   const allowedOrigins = (process.env.CORS_ORIGIN || '')
