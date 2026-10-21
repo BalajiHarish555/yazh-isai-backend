@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { JioSaavnService } from '../catalog/jiosaavn.service';
 import { YouTubeMusicService } from '../catalog/youtube-music.service';
@@ -113,7 +113,7 @@ function eraFromYear(year: unknown): string | null {
 }
 
 @Injectable()
-export class ReelsFeedService {
+export class ReelsFeedService implements OnModuleInit {
   private readonly logger = new Logger(ReelsFeedService.name);
 
   constructor(
@@ -125,6 +125,22 @@ export class ReelsFeedService {
     private cache: CacheService,
     private session: ReelSessionService,
   ) {}
+
+  /**
+   * Staggered fire-and-forget warm-up. In-memory caches die on every Render
+   * cold start, so the first real user used to pay ~2s of pool builds +
+   * catalog searches. Heating the default tamil feed shortly after boot
+   * moves that cost off the user's first swipe. Never blocks/fails boot.
+   */
+  onModuleInit(): void {
+    const timer = setTimeout(() => {
+      this.getFeed({ lang: 'tamil', limit: 20 })
+        .then((f) => this.logger.log(`Feed warmed up (${f?.items?.length ?? 0} items)`))
+        .catch(() => undefined);
+    }, 6000);
+    const t: any = timer;
+    if (t && typeof t.unref === 'function') t.unref();
+  }
 
   async getFeed(opts: {
     mood?: string;
